@@ -740,6 +740,222 @@ func (s *FriendService) CreateFriendRequest(ctx context.Context, userID, targetI
     return nil
 }
 
+#### 3.1.3 好友列表获取流程
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gate
+    participant FriendSvc
+    participant Cache
+    participant DB
+
+    Client->>Gate: 获取好友列表请求
+    Gate->>FriendSvc: 路由到好友服务
+    
+    alt 缓存存在
+        FriendSvc->>Cache: 查询缓存
+        Cache-->>FriendSvc: 返回好友列表
+    else 缓存不存在
+        FriendSvc->>DB: 查询数据库
+        DB-->>FriendSvc: 返回好友数据
+        FriendSvc->>Cache: 更新缓存
+    end
+    
+    alt 有搜索条件
+        FriendSvc->>FriendSvc: 应用搜索过滤
+    end
+    
+    alt 有分组过滤
+        FriendSvc->>FriendSvc: 应用分组过滤
+    end
+    
+    alt 有状态过滤
+        FriendSvc->>FriendSvc: 应用状态过滤
+    end
+    
+    FriendSvc->>FriendSvc: 排序处理
+    FriendSvc-->>Client: 返回好友列表
+```
+
+```go
+// 获取好友列表（支持分组和搜索）
+func (s *FriendService) GetFriendList(ctx context.Context, userID int64, opts *FriendSearchOptions) (*GetFriendListResp, error) {
+    // 1. 尝试从缓存获取
+    cacheKey := fmt.Sprintf("friend:list:%d", userID)
+    if data, err := s.redis.Get(ctx, cacheKey).Result(); err == nil {
+        var resp GetFriendListResp
+        if err := json.Unmarshal([]byte(data), &resp); err == nil {
+            return &resp, nil
+        }
+    }
+    
+    // 2. 从数据库查询
+    query := s.db.Table("friendships f").
+        Joins("JOIN users u ON f.friend_id = u.user_id").
+        Where("f.user_id = ?", userID)
+    
+    // 关键词搜索
+    if opts.Keyword != "" {
+        query = query.Where("u.username LIKE ?", "%"+opts.Keyword+"%")
+    }
+    
+    // 分组过滤
+    if opts.GroupID > 0 {
+        query = query.Where("f.group_id = ?", opts.GroupID)
+    }
+    
+    // 状态过滤
+    if opts.Status > 0 {
+        query = query.Where("u.status_code = ?", opts.Status)
+    }
+    
+    // 排序
+    if opts.SortBy != "" {
+        order := opts.SortBy
+        if opts.SortOrder == "desc" {
+            order += " DESC"
+        }
+        query = query.Order(order)
+    }
+    
+    var friends []*FriendInfoProto
+    if err := query.Find(&friends).Error; err != nil {
+        return nil, err
+    }
+    
+    resp := &GetFriendListResp{
+        Friends: friends,
+        TotalCount: int32(len(friends)),
+    }
+    
+    // 3. 更新缓存
+    if data, err := json.Marshal(resp); err == nil {
+        s.redis.Set(ctx, cacheKey, data, time.Minute*5)
+    }
+    
+    return resp, nil
+}
+```
+
+#### 3.1.4 好友分组管理流程
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gate
+    participant FriendSvc
+    participant DB
+    participant Cache
+
+    alt 创建分组
+        Client->>Gate: 创建分组请求
+        Gate->>FriendSvc: 路由到好友服务
+        FriendSvc->>DB: 创建分组记录
+        FriendSvc->>Cache: 更新分组缓存
+        FriendSvc-->>Client: 返回分组信息
+    else 移动好友到分组
+        Client->>Gate: 移动好友请求
+        Gate->>FriendSvc: 路由到好友服务
+        FriendSvc->>DB: 更新好友分组
+        FriendSvc->>Cache: 清除好友列表缓存
+        FriendSvc-->>Client: 返回处理结果
+    else 获取分组列表
+        Client->>Gate: 获取分组列表请求
+        Gate->>FriendSvc: 路由到好友服务
+        FriendSvc->>DB: 查询分组列表
+        FriendSvc-->>Client: 返回分组列表
+    end
+```
+
+```go
+// FriendGroupService 好友分组服务
+type FriendGroupService struct {
+    db     *gorm.DB
+    redis  *redis.Client
+    logger *zap.Logger
+}
+
+// CreateGroup 创建好友分组
+func (s *FriendGroupService) CreateGroup(ctx context.Context, userID int64, groupName string) (*FriendGroup, error) {
+    group := &FriendGroup{
+        UserID:    userID,
+        GroupName: groupName,
+        CreatedAt: time.Now(),
+    }
+    
+    if err := s.db.Create(group).Error; err != nil {
+        return nil, err
+    }
+    
+    // 更新缓存
+    s.updateGroupCache(ctx, userID)
+    return group, nil
+}
+
+// MoveFriendToGroup 移动好友到指定分组
+func (s *FriendGroupService) MoveFriendToGroup(ctx context.Context, userID, friendID, groupID int64) error {
+    if err := s.db.Model(&Friendship{}).
+        Where("user_id = ? AND friend_id = ?", userID, friendID).
+        Update("group_id", groupID).Error; err != nil {
+        return err
+    }
+    
+    // 更新缓存
+    s.redis.Del(ctx, fmt.Sprintf("friend:list:%d", userID))
+    return nil
+}
+
+// GetGroups 获取用户的好友分组列表
+func (s *FriendGroupService) GetGroups(ctx context.Context, userID int64) ([]*FriendGroup, error) {
+    var groups []*FriendGroup
+    if err := s.db.Where("user_id = ?", userID).Find(&groups).Error; err != nil {
+        return nil, err
+    }
+    return groups, nil
+}
+```
+
+#### 3.1.5 黑名单管理流程
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gate
+    participant FriendSvc
+    participant DB
+    participant Cache
+
+    alt 添加到黑名单
+        Client->>Gate: 添加黑名单请求
+        Gate->>FriendSvc: 路由到好友服务
+        FriendSvc->>DB: 检查是否好友
+        alt 是好友
+            FriendSvc->>DB: 删除好友关系
+            FriendSvc->>Cache: 清除好友缓存
+        end
+        FriendSvc->>DB: 添加到黑名单
+        FriendSvc->>Cache: 更新黑名单缓存
+        FriendSvc-->>Client: 返回处理结果
+    else 从黑名单移除
+        Client->>Gate: 移除黑名单请求
+        Gate->>FriendSvc: 路由到好友服务
+        FriendSvc->>DB: 从黑名单移除
+        FriendSvc->>Cache: 更新黑名单缓存
+        FriendSvc-->>Client: 返回处理结果
+    else 获取黑名单列表
+        Client->>Gate: 获取黑名单请求
+        Gate->>FriendSvc: 路由到好友服务
+        FriendSvc->>Cache: 查询黑名单缓存
+        alt 缓存不存在
+            FriendSvc->>DB: 查询数据库
+            FriendSvc->>Cache: 更新缓存
+        end
+        FriendSvc-->>Client: 返回黑名单列表
+    end
+```
+
+```go
 // AddToBlacklist 添加用户到黑名单
 func (s *FriendService) AddToBlacklist(ctx context.Context, userID, targetID int64) error {
     // 1. 获取分布式锁
@@ -875,141 +1091,6 @@ func (s *FriendService) handleBlacklistMsg(ctx context.Context, session *Session
     default:
         return errors.New("unknown message id")
     }
-}
-```
-
-#### 3.1.3 好友列表管理
-
-```go
-// 获取好友列表（支持分组和搜索）
-func (s *FriendService) GetFriendList(ctx context.Context, userID int64, opts *FriendSearchOptions) (*GetFriendListResp, error) {
-    // 1. 尝试从缓存获取
-    cacheKey := fmt.Sprintf("friend:list:%d", userID)
-    if data, err := s.redis.Get(ctx, cacheKey).Result(); err == nil {
-        var resp GetFriendListResp
-        if err := json.Unmarshal([]byte(data), &resp); err == nil {
-            return &resp, nil
-        }
-    }
-    
-    // 2. 从数据库查询
-    query := s.db.Table("friendships f").
-        Joins("JOIN users u ON f.friend_id = u.user_id").
-        Where("f.user_id = ?", userID)
-    
-    // 关键词搜索
-    if opts.Keyword != "" {
-        query = query.Where("u.username LIKE ?", "%"+opts.Keyword+"%")
-    }
-    
-    // 分组过滤
-    if opts.GroupID > 0 {
-        query = query.Where("f.group_id = ?", opts.GroupID)
-    }
-    
-    // 状态过滤
-    if opts.Status > 0 {
-        query = query.Where("u.status_code = ?", opts.Status)
-    }
-    
-    // 排序
-    if opts.SortBy != "" {
-        order := opts.SortBy
-        if opts.SortOrder == "desc" {
-            order += " DESC"
-        }
-        query = query.Order(order)
-    }
-    
-    var friends []*FriendInfoProto
-    if err := query.Find(&friends).Error; err != nil {
-        return nil, err
-    }
-    
-    resp := &GetFriendListResp{
-        Friends: friends,
-        TotalCount: int32(len(friends)),
-    }
-    
-    // 3. 更新缓存
-    if data, err := json.Marshal(resp); err == nil {
-        s.redis.Set(ctx, cacheKey, data, time.Minute*5)
-    }
-    
-    return resp, nil
-}
-
-// 删除好友
-func (s *FriendService) DeleteFriend(ctx context.Context, userID, friendID int64) error {
-    // 1. 获取分布式锁
-    lockKey := fmt.Sprintf("lock:friend:del:%d:%d", userID, friendID)
-    lock := s.redisLock.NewLock(lockKey, time.Second*30)
-    if err := lock.Lock(); err != nil {
-        return err
-    }
-    defer lock.Unlock()
-    
-    // 2. 删除好友关系
-    if err := s.db.Where("(user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)",
-        userID, friendID, friendID, userID).Delete(&Friendship{}).Error; err != nil {
-        return err
-    }
-    
-    // 3. 清除缓存
-    s.redis.Del(ctx, fmt.Sprintf("friend:list:%d", userID))
-    s.redis.Del(ctx, fmt.Sprintf("friend:list:%d", friendID))
-    
-    return nil
-}
-```
-
-#### 3.1.4 好友分组管理
-
-```go
-// FriendGroupService 好友分组服务
-type FriendGroupService struct {
-    db     *gorm.DB
-    redis  *redis.Client
-    logger *zap.Logger
-}
-
-// CreateGroup 创建好友分组
-func (s *FriendGroupService) CreateGroup(ctx context.Context, userID int64, groupName string) (*FriendGroup, error) {
-    group := &FriendGroup{
-        UserID:    userID,
-        GroupName: groupName,
-        CreatedAt: time.Now(),
-    }
-    
-    if err := s.db.Create(group).Error; err != nil {
-        return nil, err
-    }
-    
-    // 更新缓存
-    s.updateGroupCache(ctx, userID)
-    return group, nil
-}
-
-// MoveFriendToGroup 移动好友到指定分组
-func (s *FriendGroupService) MoveFriendToGroup(ctx context.Context, userID, friendID, groupID int64) error {
-    if err := s.db.Model(&Friendship{}).
-        Where("user_id = ? AND friend_id = ?", userID, friendID).
-        Update("group_id", groupID).Error; err != nil {
-        return err
-    }
-    
-    // 更新缓存
-    s.redis.Del(ctx, fmt.Sprintf("friend:list:%d", userID))
-    return nil
-}
-
-// GetGroups 获取用户的好友分组列表
-func (s *FriendGroupService) GetGroups(ctx context.Context, userID int64) ([]*FriendGroup, error) {
-    var groups []*FriendGroup
-    if err := s.db.Where("user_id = ?", userID).Find(&groups).Error; err != nil {
-        return nil, err
-    }
-    return groups, nil
 }
 ```
 
