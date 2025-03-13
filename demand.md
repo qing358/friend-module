@@ -1,127 +1,8 @@
 # 游戏好友系统技术设计文档
 
-## 1. 系统架构
+## 1. 通信协议定义 (Protobuf)
 
-### 1.1 整体架构
-系统采用分布式架构，使用 Golang 作为主要开发语言，基于 TCP 长连接和 Protobuf 协议通信，整体架构如下：
-
-```mermaid
-graph TD
-    A[Gate Server] --> B[Friend Service]
-    A --> C[Status Service]
-    A --> D[Recommendation Service]
-    
-    B --> E[Redis Cluster]
-    B --> F[MySQL Master]
-    F --> G[MySQL Slave]
-    
-    C --> E
-    D --> E
-    
-    Client1[游戏客户端] -.TCP.-> A
-    Client2[游戏客户端] -.TCP.-> A
-    
-    style A fill:#f9f,stroke:#333,stroke-width:2px
-    style B fill:#bbf,stroke:#333,stroke-width:2px
-    style C fill:#bbf,stroke:#333,stroke-width:2px
-    style D fill:#bbf,stroke:#333,stroke-width:2px
-```
-
-### 1.2 核心组件
-
-1. **Gate Server（网关服务器）**
-   - 维护与游戏客户端的 TCP 长连接
-   - 处理消息的编解码（Protobuf）
-   - 实现消息路由分发
-   - 管理用户会话（Session）
-   - 处理心跳保活
-
-2. **Friend Service（好友服务）**
-   - 处理好友关系管理
-   - 好友分组管理
-   - 好友请求处理
-   - 黑名单管理
-   - 好友列表查询和搜索
-
-3. **Status Service（状态服务）**
-   - 维护用户在线状态
-   - 处理状态变更通知
-   - 管理用户游戏状态
-   - 状态广播给好友
-
-4. **Recommendation Service（推荐服务）**
-   - 收集用户行为数据
-   - 计算用户相似度
-   - 生成好友推荐
-   - 推荐原因分析
-
-5. **Redis Cluster（缓存集群）**
-   - 好友列表缓存
-   - 用户状态缓存
-   - 好友请求缓存
-   - 黑名单缓存
-   - 游戏偏好缓存
-   - 分布式锁服务
-
-6. **MySQL（数据存储）**
-   - 主从架构
-   - 存储用户数据
-   - 存储好友关系
-   - 存储历史记录
-   - 数据持久化
-
-### 1.3 服务通信流程
-
-```mermaid
-sequenceDiagram
-    participant Client as 游戏客户端
-    participant Gate as Gate Server
-    participant Friend as Friend Service
-    participant Status as Status Service
-    participant Redis as Redis Cluster
-    participant DB as MySQL
-
-    Client->>Gate: 1. 建立TCP连接
-    Gate->>Status: 2. 创建会话&更新状态
-    Status->>Redis: 3. 缓存状态
-    Status->>DB: 4. 持久化状态
-    
-    Client->>Gate: 5. 发送业务请求
-    Gate->>Friend: 6. 路由到对应服务
-    Friend->>Redis: 7. 查询缓存
-    Friend->>DB: 8. 数据持久化
-    Friend-->>Client: 9. 返回响应
-```
-
-### 1.4 关键技术点
-
-1. **长连接管理**
-   - 使用 goroutine 处理每个连接
-   - 心跳机制保活
-   - 连接断开自动重连
-   - 会话状态维护
-
-2. **数据一致性**
-   - 分布式锁控制并发
-   - 缓存更新策略
-   - 数据库主从同步
-   - 状态同步机制
-
-3. **高可用设计**
-   - 服务无状态设计
-   - 多实例部署
-   - 故障自动转移
-   - 容灾备份方案
-
-4. **性能优化**
-   - 连接池管理
-   - 批量处理机制
-   - 异步处理模型
-   - 多级缓存策略
-
-### 1.5 通信协议定义 (Protobuf)
-
-#### 1.5.1 协议概览
+#### 1.1 协议概览
 - **好友管理模块**
   - 好友请求 (1001-1007)
   - 好友分组 (1101-1104)
@@ -131,7 +12,7 @@ sequenceDiagram
 - **推荐系统模块**
   - 好友推荐 (3001-3002)
 
-#### 1.5.2 基础消息定义
+#### 1.2 基础消息定义
 ```protobuf
 syntax = "proto3";
 package friend;
@@ -251,7 +132,7 @@ service FriendService {
 }
 ```
 
-#### 1.5.3 好友管理模块
+#### 1.3 好友管理模块
 ```protobuf
 // 好友请求相关
 message FriendRequestProto {
@@ -305,7 +186,7 @@ message MoveFriendToGroupResp {
 }
 ```
 
-#### 1.5.4 状态管理模块
+#### 1.4 状态管理模块
 ```protobuf
 // 状态更新相关
 message FriendStatusNotify {
@@ -328,7 +209,7 @@ message UpdateStatusResp {
 }
 ```
 
-#### 1.5.5 推荐系统模块
+#### 1.5 推荐系统模块
 ```protobuf
 // 推荐相关消息ID
 message GetRecommendationsReq {
@@ -340,7 +221,7 @@ message GetRecommendationsResp {
 }
 ```
 
-#### 1.5.6 消息ID定义
+#### 1.6 消息ID定义
 ```go
 const (
     // 好友管理相关消息ID (1001-1007)
@@ -377,73 +258,6 @@ const (
     MSG_ID_GET_RECOMMENDATIONS_REQ  = 3001
     MSG_ID_GET_RECOMMENDATIONS_RESP = 3002
 )
-```
-
-### 1.6 网关服务实现
-
-```go
-// GateServer TCP网关服务器
-type GateServer struct {
-    listener   net.Listener
-    sessions   sync.Map // 保存所有的客户端连接
-    router     *Router  // 消息路由器
-    friendSvc  *FriendService
-    statusSvc  *StatusService
-}
-
-// Session 客户端会话
-type Session struct {
-    conn      net.Conn
-    userID    int64
-    writeChan chan []byte
-    ctx       context.Context
-    cancel    context.CancelFunc
-}
-
-// 处理客户端连接
-func (s *GateServer) handleConnection(conn net.Conn) {
-    session := NewSession(conn)
-    defer session.Close()
-
-    // 读取消息循环
-    for {
-        // 1. 读取消息头（长度+消息ID）
-        header, err := readHeader(conn)
-        if err != nil {
-            return
-        }
-
-        // 2. 读取消息体
-        data, err := readBody(conn, header.Length)
-        if err != nil {
-            return
-        }
-
-        // 3. 根据消息ID路由到对应的处理器
-        if err := s.router.Route(session, header.MsgID, data); err != nil {
-            log.Printf("Route message error: %v", err)
-        }
-    }
-}
-
-// 发送消息到客户端
-func (s *Session) Send(msgID uint32, msg proto.Message) error {
-    data, err := proto.Marshal(msg)
-    if err != nil {
-        return err
-    }
-
-    // 构造消息包（头部+消息体）
-    packet := NewPacket(msgID, data)
-    
-    // 异步发送
-    select {
-    case s.writeChan <- packet:
-        return nil
-    case <-s.ctx.Done():
-        return errors.New("session closed")
-    }
-}
 ```
 
 ## 2. 数据模型设计
@@ -1740,123 +1554,3 @@ func (s *RecommendationService) GetRecommendations(ctx context.Context, userID i
     return recommendations[:min(10, len(recommendations))], nil
 }
 ```
-
-## 4. 性能优化策略
-
-### 4.1 缓存策略
-
-```mermaid
-graph TD
-    A[请求] --> B{缓存是否存在?}
-    B -->|是| C[返回缓存数据]
-    B -->|否| D[查询数据库]
-    D --> E[更新缓存]
-    E --> C
-```
-
-### 4.2 数据库优化
-1. **分库分表策略**：
-   - 按用户ID范围水平分片
-   - 使用一致性哈希算法
-   - 预留分片扩展空间
-
-2. **索引优化**：
-   - 为高频查询字段建立索引
-   - 避免过度索引
-   - 定期维护索引统计信息
-
-### 4.3 并发处理
-
-```go
-// 使用分布式锁处理并发
-func (s *FriendService) AddFriend(ctx context.Context, userID, friendID int64) error {
-    // 获取分布式锁
-    lockKey := fmt.Sprintf("lock:friend:add:%d:%d", userID, friendID)
-    lock := s.redisLock.NewLock(lockKey, time.Second*30)
-    
-    if err := lock.Lock(); err != nil {
-        return fmt.Errorf("failed to acquire lock: %w", err)
-    }
-    defer lock.Unlock()
-
-    // 处理好友添加逻辑
-    return s.processFriendAdd(ctx, userID, friendID)
-}
-```
-
-## 5. 监控告警
-
-### 5.1 监控指标
-1. **系统性能指标**
-   - QPS
-   - 响应时间
-   - 错误率
-   - Goroutine 数量
-
-2. **业务指标**
-   - 好友添加成功率
-   - 推荐准确率
-   - 消息投递成功率
-
-### 5.2 告警策略
-
-```mermaid
-graph TD
-    A[监控指标] --> B{是否超过阈值?}
-    B -->|是| C[触发告警]
-    C --> D[钉钉通知]
-    C --> E[邮件通知]
-    C --> F[短信通知]
-    B -->|否| G[继续监控]
-```
-
-## 6. 部署架构
-
-```mermaid
-graph TD
-    A[负载均衡器] --> B[Service Instance 1]
-    A --> C[Service Instance 2]
-    A --> D[Service Instance N]
-    B --> E[Redis Cluster]
-    C --> E
-    D --> E
-    B --> F[MySQL Master]
-    C --> F
-    D --> F
-    F --> G[MySQL Slave 1]
-    F --> H[MySQL Slave 2]
-```
-
-## 7. 扩展性设计
-
-1. **服务无状态化**
-   - 所有服务实例无状态
-   - 支持水平扩展
-   - 使用服务发现
-
-2. **接口版本控制**
-   - URL 版本号
-   - 向下兼容
-   - 平滑升级策略
-
-3. **跨区域部署**
-   - 多区域数据同步
-   - 就近访问策略
-   - 容灾备份方案
-
-## 8. 开发规范
-
-1. **代码规范**
-   - 遵循 Golang 官方规范
-   - 统一错误处理
-   - 完善的注释文档
-
-2. **API 规范**
-   - RESTful API 设计
-   - 统一响应格式
-   - 请求参数验证
-
-3. **日志规范**
-   - 统一日志格式
-   - 分级日志
-   - 链路追踪
