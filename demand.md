@@ -663,6 +663,219 @@ func (s *FriendService) AddFriend(ctx context.Context, userID int64, target stri
     // 4. 创建好友请求
     return s.CreateFriendRequest(ctx, userID, targetUser.UserID)
 }
+
+// IsFriend 检查两个用户是否已经是好友
+func (s *FriendService) IsFriend(ctx context.Context, userID, friendID int64) bool {
+    // 1. 先查缓存
+    cacheKey := fmt.Sprintf(CACHE_KEY_FRIEND_LIST, userID)
+    if exists, err := s.redis.SIsMember(ctx, cacheKey, friendID).Result(); err == nil && exists {
+        return true
+    }
+    
+    // 2. 查数据库
+    var count int64
+    s.db.Model(&Friendship{}).
+        Where("(user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)",
+            userID, friendID, friendID, userID).
+        Count(&count)
+    
+    return count > 0
+}
+
+// IsInBlacklist 检查用户是否在黑名单中
+func (s *FriendService) IsInBlacklist(ctx context.Context, userID, targetID int64) bool {
+    // 1. 先查缓存
+    cacheKey := fmt.Sprintf(CACHE_KEY_BLACKLIST, userID)
+    if exists, err := s.redis.SIsMember(ctx, cacheKey, targetID).Result(); err == nil && exists {
+        return true
+    }
+    
+    // 2. 查数据库
+    var count int64
+    s.db.Model(&Blacklist{}).
+        Where("user_id = ? AND target_id = ?", userID, targetID).
+        Count(&count)
+    
+    return count > 0
+}
+
+// CreateFriendRequest 创建好友请求
+func (s *FriendService) CreateFriendRequest(ctx context.Context, userID, targetID int64) error {
+    // 1. 获取分布式锁
+    lockKey := fmt.Sprintf(CACHE_KEY_LOCK_FRIEND, userID, targetID)
+    lock := s.redisLock.NewLock(lockKey, time.Second*30)
+    if err := lock.Lock(); err != nil {
+        return fmt.Errorf("failed to acquire lock: %w", err)
+    }
+    defer lock.Unlock()
+    
+    // 2. 创建好友请求
+    request := &FriendRequest{
+        RequestID:  generateID(), // 生成唯一ID
+        SenderID:   userID,
+        ReceiverID: targetID,
+        Status:     FRIEND_REQUEST_PENDING,
+        CreatedAt:  time.Now(),
+    }
+    
+    if err := s.db.Create(request).Error; err != nil {
+        return err
+    }
+    
+    // 3. 更新缓存
+    cacheKey := fmt.Sprintf(CACHE_KEY_PENDING_REQUESTS, targetID)
+    s.redis.RPush(ctx, cacheKey, request.RequestID)
+    
+    // 4. 发送通知
+    if session, ok := s.sessions.Load(targetID); ok {
+        session.(*Session).Send(MSG_ID_FRIEND_REQUEST_NOTIFY, &FriendRequestProto{
+            RequestID:  request.RequestID,
+            SenderID:   request.SenderID,
+            ReceiverID: request.ReceiverID,
+            Status:     request.Status,
+            CreatedAt:  request.CreatedAt.Unix(),
+        })
+    }
+    
+    return nil
+}
+
+// AddToBlacklist 添加用户到黑名单
+func (s *FriendService) AddToBlacklist(ctx context.Context, userID, targetID int64) error {
+    // 1. 获取分布式锁
+    lockKey := fmt.Sprintf(CACHE_KEY_LOCK_FRIEND, userID, targetID)
+    lock := s.redisLock.NewLock(lockKey, time.Second*30)
+    if err := lock.Lock(); err != nil {
+        return fmt.Errorf("failed to acquire lock: %w", err)
+    }
+    defer lock.Unlock()
+    
+    // 2. 检查是否已经是好友
+    if s.IsFriend(ctx, userID, targetID) {
+        // 删除好友关系
+        if err := s.DeleteFriend(ctx, userID, targetID); err != nil {
+            return err
+        }
+    }
+    
+    // 3. 添加到黑名单
+    blacklist := &Blacklist{
+        ID:        generateID(),
+        UserID:    userID,
+        TargetID:  targetID,
+        CreatedAt: time.Now(),
+    }
+    
+    if err := s.db.Create(blacklist).Error; err != nil {
+        return err
+    }
+    
+    // 4. 更新缓存
+    cacheKey := fmt.Sprintf(CACHE_KEY_BLACKLIST, userID)
+    s.redis.SAdd(ctx, cacheKey, targetID)
+    
+    return nil
+}
+
+// RemoveFromBlacklist 从黑名单移除用户
+func (s *FriendService) RemoveFromBlacklist(ctx context.Context, userID, targetID int64) error {
+    // 1. 获取分布式锁
+    lockKey := fmt.Sprintf(CACHE_KEY_LOCK_FRIEND, userID, targetID)
+    lock := s.redisLock.NewLock(lockKey, time.Second*30)
+    if err := lock.Lock(); err != nil {
+        return fmt.Errorf("failed to acquire lock: %w", err)
+    }
+    defer lock.Unlock()
+    
+    // 2. 从数据库删除
+    if err := s.db.Where("user_id = ? AND target_id = ?", userID, targetID).
+        Delete(&Blacklist{}).Error; err != nil {
+        return err
+    }
+    
+    // 3. 更新缓存
+    cacheKey := fmt.Sprintf(CACHE_KEY_BLACKLIST, userID)
+    s.redis.SRem(ctx, cacheKey, targetID)
+    
+    return nil
+}
+
+// GetBlacklist 获取用户的黑名单列表
+func (s *FriendService) GetBlacklist(ctx context.Context, userID int64) ([]*UserInfo, error) {
+    // 1. 先查缓存
+    cacheKey := fmt.Sprintf(CACHE_KEY_BLACKLIST, userID)
+    if data, err := s.redis.Get(ctx, cacheKey).Result(); err == nil {
+        var users []*UserInfo
+        if err := json.Unmarshal([]byte(data), &users); err == nil {
+            return users, nil
+        }
+    }
+    
+    // 2. 查数据库
+    var blacklist []*Blacklist
+    if err := s.db.Where("user_id = ?", userID).Find(&blacklist).Error; err != nil {
+        return nil, err
+    }
+    
+    // 3. 获取用户信息
+    targetIDs := make([]int64, len(blacklist))
+    for i, b := range blacklist {
+        targetIDs[i] = b.TargetID
+    }
+    
+    var users []*UserInfo
+    if err := s.db.Where("user_id IN ?", targetIDs).Find(&users).Error; err != nil {
+        return nil, err
+    }
+    
+    // 4. 更新缓存
+    if data, err := json.Marshal(users); err == nil {
+        s.redis.Set(ctx, cacheKey, data, time.Hour*24)
+    }
+    
+    return users, nil
+}
+
+// 处理黑名单相关消息
+func (s *FriendService) handleBlacklistMsg(ctx context.Context, session *Session, msgID uint32, data []byte) error {
+    switch msgID {
+    case MSG_ID_ADD_BLACKLIST_REQ:
+        var req struct {
+            UserID   int64 `json:"user_id"`
+            TargetID int64 `json:"target_id"`
+        }
+        if err := json.Unmarshal(data, &req); err != nil {
+            return err
+        }
+        return s.AddToBlacklist(ctx, req.UserID, req.TargetID)
+        
+    case MSG_ID_DEL_BLACKLIST_REQ:
+        var req struct {
+            UserID   int64 `json:"user_id"`
+            TargetID int64 `json:"target_id"`
+        }
+        if err := json.Unmarshal(data, &req); err != nil {
+            return err
+        }
+        return s.RemoveFromBlacklist(ctx, req.UserID, req.TargetID)
+        
+    case MSG_ID_GET_BLACKLIST_REQ:
+        var req struct {
+            UserID int64 `json:"user_id"`
+        }
+        if err := json.Unmarshal(data, &req); err != nil {
+            return err
+        }
+        users, err := s.GetBlacklist(ctx, req.UserID)
+        if err != nil {
+            return err
+        }
+        return session.Send(MSG_ID_GET_BLACKLIST_RESP, users)
+        
+    default:
+        return errors.New("unknown message id")
+    }
+}
 ```
 
 #### 3.1.3 好友列表管理
@@ -910,6 +1123,109 @@ func (m *StatusManager) UpdateStatus(ctx context.Context, userID int64, status i
     }
     
     return m.updateStatus(ctx, newStatus)
+}
+
+// updateStatus 内部实现状态更新
+func (m *StatusManager) updateStatus(ctx context.Context, status *UserStatus) error {
+    // 1. 获取分布式锁
+    lockKey := fmt.Sprintf(CACHE_KEY_LOCK_STATUS, status.UserID)
+    lock := m.redisLock.NewLock(lockKey, time.Second*30)
+    if err := lock.Lock(); err != nil {
+        return fmt.Errorf("failed to acquire lock: %w", err)
+    }
+    defer lock.Unlock()
+
+    // 2. 更新数据库
+    if err := m.db.Model(&UserStatus{}).
+        Where("user_id = ?", status.UserID).
+        Updates(map[string]interface{}{
+            "status":        status.Status,
+            "custom_status": status.CustomStatus,
+            "last_updated":  time.Now(),
+        }).Error; err != nil {
+        return fmt.Errorf("failed to update status in db: %w", err)
+    }
+
+    // 3. 更新Redis缓存
+    cacheKey := fmt.Sprintf(CACHE_KEY_USER_STATUS, status.UserID)
+    statusData, err := json.Marshal(status)
+    if err != nil {
+        return fmt.Errorf("failed to marshal status: %w", err)
+    }
+
+    // 使用Pipeline批量执行Redis操作
+    pipe := m.redis.Pipeline()
+    
+    // 更新状态详情
+    pipe.Set(ctx, cacheKey, statusData, CACHE_EXPIRE_USER_STATUS)
+    
+    // 更新在线用户集合
+    if status.Status == STATUS_ONLINE {
+        pipe.SAdd(ctx, CACHE_KEY_ONLINE_USERS, status.UserID)
+    } else {
+        pipe.SRem(ctx, CACHE_KEY_ONLINE_USERS, status.UserID)
+    }
+    
+    if _, err := pipe.Exec(ctx); err != nil {
+        return fmt.Errorf("failed to update redis cache: %w", err)
+    }
+
+    // 4. 获取好友列表并发送通知
+    friends, err := m.getFriendIDs(status.UserID)
+    if err != nil {
+        m.logger.Error("failed to get friend ids", 
+            zap.Error(err),
+            zap.Int64("user_id", status.UserID))
+        return nil // 不中断状态更新流程
+    }
+
+    // 5. 异步发送状态更新通知
+    go func() {
+        for _, friendID := range friends {
+            if session, ok := m.sessions.Load(friendID); ok {
+                session.(*Session).Send(MSG_ID_FRIEND_STATUS_NOTIFY, &FriendStatusNotify{
+                    UserID:       status.UserID,
+                    Status:       status.Status,
+                    CurrentGame:  status.CurrentGame,
+                    CustomStatus: status.CustomStatus,
+                    UpdatedAt:    status.UpdatedAt,
+                })
+            }
+        }
+    }()
+
+    return nil
+}
+
+// getFriendIDs 获取用户的好友ID列表
+func (m *StatusManager) getFriendIDs(userID int64) ([]int64, error) {
+    // 1. 先查缓存
+    cacheKey := fmt.Sprintf(CACHE_KEY_FRIEND_LIST, userID)
+    if data, err := m.redis.Get(context.Background(), cacheKey).Result(); err == nil {
+        var friends []int64
+        if err := json.Unmarshal([]byte(data), &friends); err == nil {
+            return friends, nil
+        }
+    }
+
+    // 2. 查数据库
+    var friendships []Friendship
+    if err := m.db.Where("user_id = ?", userID).Find(&friendships).Error; err != nil {
+        return nil, err
+    }
+
+    // 3. 提取好友ID
+    friendIDs := make([]int64, len(friendships))
+    for i, f := range friendships {
+        friendIDs[i] = f.FriendID
+    }
+
+    // 4. 更新缓存
+    if data, err := json.Marshal(friendIDs); err == nil {
+        m.redis.Set(context.Background(), cacheKey, data, CACHE_EXPIRE_FRIEND_LIST)
+    }
+
+    return friendIDs, nil
 }
 ```
 
