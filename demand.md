@@ -121,6 +121,17 @@ sequenceDiagram
 
 ### 1.5 通信协议定义 (Protobuf)
 
+#### 1.5.1 协议概览
+- **好友管理模块**
+  - 好友请求 (1001-1007)
+  - 好友分组 (1101-1104)
+  - 黑名单管理 (1201-1206)
+- **状态管理模块**
+  - 状态更新 (2001-2005)
+- **推荐系统模块**
+  - 好友推荐 (3001-3002)
+
+#### 1.5.2 基础消息定义
 ```protobuf
 syntax = "proto3";
 package friend;
@@ -213,14 +224,158 @@ message MoveFriendToGroupResp {
     string message = 2;
 }
 
+// 状态更新相关
+message UpdateStatusReq {
+    int64 user_id = 1;
+    int32 status = 2;
+    string custom_status = 3;
+}
+
+message UpdateStatusResp {
+    bool success = 1;
+    string message = 2;
+}
+
 // 服务定义
 service FriendService {
+    // 好友管理接口
     rpc GetFriendList(GetFriendListReq) returns (GetFriendListResp);
     rpc AddFriend(AddFriendReq) returns (AddFriendResp);
+    
+    // 状态管理接口
     rpc UpdateStatus(FriendStatusNotify) returns (google.protobuf.Empty);
+    
+    // 分组管理接口
     rpc CreateGroup(CreateGroupReq) returns (CreateGroupResp);
     rpc MoveFriendToGroup(MoveFriendToGroupReq) returns (MoveFriendToGroupResp);
 }
+
+#### 1.5.3 好友管理模块
+```protobuf
+// 好友请求相关
+message FriendRequestProto {
+    int64 request_id = 1;
+    int64 sender_id = 2;
+    int64 receiver_id = 3;
+    int32 status = 4;      // 0:待处理 1:已接受 2:已拒绝
+    int64 created_at = 5;
+}
+
+message AddFriendReq {
+    int64 user_id = 1;
+    int64 friend_id = 2;
+    string message = 3;
+}
+
+message AddFriendResp {
+    bool success = 1;
+    string message = 2;
+    FriendRequestProto request = 3;
+}
+
+// 好友分组相关
+message FriendGroupProto {
+    int64 group_id = 1;
+    int64 user_id = 2;
+    string group_name = 3;
+    int64 created_at = 4;
+}
+
+message CreateGroupReq {
+    int64 user_id = 1;
+    string group_name = 2;
+}
+
+message CreateGroupResp {
+    bool success = 1;
+    string message = 2;
+    FriendGroupProto group = 3;
+}
+
+message MoveFriendToGroupReq {
+    int64 user_id = 1;
+    int64 friend_id = 2;
+    int64 group_id = 3;
+}
+
+message MoveFriendToGroupResp {
+    bool success = 1;
+    string message = 2;
+}
+```
+
+#### 1.5.4 状态管理模块
+```protobuf
+// 状态更新相关
+message FriendStatusNotify {
+    int64 user_id = 1;
+    int32 status = 2;
+    string current_game = 3;
+    string custom_status = 4;
+    int64 updated_at = 5;
+}
+
+message UpdateStatusReq {
+    int64 user_id = 1;
+    int32 status = 2;
+    string custom_status = 3;
+}
+
+message UpdateStatusResp {
+    bool success = 1;
+    string message = 2;
+}
+```
+
+#### 1.5.5 推荐系统模块
+```protobuf
+// 推荐相关消息ID
+message GetRecommendationsReq {
+    int64 user_id = 1;
+}
+
+message GetRecommendationsResp {
+    repeated FriendRecommendation recommendations = 1;
+}
+```
+
+#### 1.5.6 消息ID定义
+```go
+const (
+    // 好友管理相关消息ID (1001-1007)
+    MSG_ID_ADD_FRIEND_REQ         = 1001
+    MSG_ID_ADD_FRIEND_RESP        = 1002
+    MSG_ID_DEL_FRIEND_REQ         = 1003
+    MSG_ID_DEL_FRIEND_RESP        = 1004
+    MSG_ID_GET_FRIEND_LIST_REQ    = 1005
+    MSG_ID_GET_FRIEND_LIST_RESP   = 1006
+    MSG_ID_FRIEND_REQUEST_NOTIFY  = 1007
+    
+    // 好友分组相关消息ID (1101-1104)
+    MSG_ID_CREATE_GROUP_REQ       = 1101
+    MSG_ID_CREATE_GROUP_RESP      = 1102
+    MSG_ID_MOVE_TO_GROUP_REQ      = 1103
+    MSG_ID_MOVE_TO_GROUP_RESP     = 1104
+    
+    // 黑名单相关消息ID (1201-1206)
+    MSG_ID_ADD_BLACKLIST_REQ      = 1201
+    MSG_ID_ADD_BLACKLIST_RESP     = 1202
+    MSG_ID_DEL_BLACKLIST_REQ      = 1203
+    MSG_ID_DEL_BLACKLIST_RESP     = 1204
+    MSG_ID_GET_BLACKLIST_REQ      = 1205
+    MSG_ID_GET_BLACKLIST_RESP     = 1206
+    
+    // 状态相关消息ID (2001-2005)
+    MSG_ID_UPDATE_STATUS_REQ      = 2001
+    MSG_ID_UPDATE_STATUS_RESP     = 2002
+    MSG_ID_FRIEND_STATUS_NOTIFY   = 2003
+    MSG_ID_GET_FRIEND_STATUS_REQ  = 2004
+    MSG_ID_GET_FRIEND_STATUS_RESP = 2005
+    
+    // 推荐相关消息ID (3001-3002)
+    MSG_ID_GET_RECOMMENDATIONS_REQ  = 3001
+    MSG_ID_GET_RECOMMENDATIONS_RESP = 3002
+)
 ```
 
 ### 1.6 网关服务实现
@@ -785,7 +940,7 @@ func (s *FriendService) IsFriend(ctx context.Context, userID, friendID int64) bo
     var count int64
     s.db.Model(&Friendship{}).
         Where("(user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)",
-            userID, friendID, friendID, userID).
+            user_id, friend_id, friend_id, user_id).
         Count(&count)
     
     return count > 0
@@ -802,7 +957,7 @@ func (s *FriendService) IsInBlacklist(ctx context.Context, userID, targetID int6
     // 2. 查数据库
     var count int64
     s.db.Model(&Blacklist{}).
-        Where("user_id = ? AND target_id = ?", userID, targetID).
+        Where("user_id = ? AND target_id = ?", user_id, target_id).
         Count(&count)
     
     return count > 0
