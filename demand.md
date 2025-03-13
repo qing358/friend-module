@@ -3,11 +3,11 @@
 ## 1. 系统架构
 
 ### 1.1 整体架构
-系统采用微服务架构，使用 Golang 作为主要开发语言，整体架构如下：
+系统采用分布式架构，使用 Golang 作为主要开发语言，基于 TCP 长连接和 Protobuf 协议通信，整体架构如下：
 
 ```mermaid
 graph TD
-    A[API Gateway] --> B[Friend Service]
+    A[Gate Server] --> B[Friend Service]
     A --> C[Status Service]
     A --> D[Recommendation Service]
     B --> E[Redis Cache]
@@ -17,6 +17,10 @@ graph TD
     C --> E
     D --> E
     H --> I[Notification Service]
+    
+    Client1[游戏客户端] -.TCP.-> A
+    Client2[游戏客户端] -.TCP.-> A
+    
     style A fill:#f9f,stroke:#333,stroke-width:2px
     style B fill:#bbf,stroke:#333,stroke-width:2px
     style C fill:#bbf,stroke:#333,stroke-width:2px
@@ -24,12 +28,147 @@ graph TD
 ```
 
 ### 1.2 核心组件
-1. **Friend Service**: 好友关系管理核心服务
-2. **Status Service**: 在线状态管理服务
-3. **Recommendation Service**: 好友推荐服务
-4. **Notification Service**: 消息推送服务
+1. **Gate Server**: TCP 网关服务器，负责维护客户端连接和消息路由
+2. **Friend Service**: 好友关系管理核心服务
+3. **Status Service**: 在线状态管理服务
+4. **Recommendation Service**: 好友推荐服务
 5. **Cache Layer**: 使用 Redis 集群作为缓存层
 6. **Message Queue**: 使用 Kafka 作为消息队列
+
+### 1.3 通信协议定义 (Protobuf)
+
+```protobuf
+syntax = "proto3";
+package friend;
+
+// 好友请求消息
+message FriendRequestProto {
+    int64 request_id = 1;
+    int64 sender_id = 2;
+    int64 receiver_id = 3;
+    int32 status = 4;      // 0:待处理 1:已接受 2:已拒绝
+    int64 created_at = 5;
+}
+
+// 好友信息
+message FriendInfoProto {
+    int64 user_id = 1;
+    string username = 2;
+    int32 status = 3;      // 1:在线 2:离开 3:繁忙 4:隐身
+    string current_game = 4;
+    string custom_status = 5;
+}
+
+// 好友列表请求
+message GetFriendListReq {
+    int64 user_id = 1;
+    int32 page_size = 2;
+    int32 page_num = 3;
+}
+
+// 好友列表响应
+message GetFriendListResp {
+    repeated FriendInfoProto friends = 1;
+    int32 total_count = 2;
+}
+
+// 添加好友请求
+message AddFriendReq {
+    int64 user_id = 1;
+    int64 friend_id = 2;
+    string message = 3;
+}
+
+// 添加好友响应
+message AddFriendResp {
+    bool success = 1;
+    string message = 2;
+    FriendRequestProto request = 3;
+}
+
+// 好友状态变更通知
+message FriendStatusNotify {
+    int64 user_id = 1;
+    int32 status = 2;
+    string current_game = 3;
+    string custom_status = 4;
+    int64 updated_at = 5;
+}
+
+// 服务定义
+service FriendService {
+    rpc GetFriendList(GetFriendListReq) returns (GetFriendListResp);
+    rpc AddFriend(AddFriendReq) returns (AddFriendResp);
+    rpc UpdateStatus(FriendStatusNotify) returns (google.protobuf.Empty);
+}
+```
+
+### 1.4 网关服务实现
+
+```go
+// GateServer TCP网关服务器
+type GateServer struct {
+    listener   net.Listener
+    sessions   sync.Map // 保存所有的客户端连接
+    router     *Router  // 消息路由器
+    friendSvc  *FriendService
+    statusSvc  *StatusService
+}
+
+// Session 客户端会话
+type Session struct {
+    conn      net.Conn
+    userID    int64
+    writeChan chan []byte
+    ctx       context.Context
+    cancel    context.CancelFunc
+}
+
+// 处理客户端连接
+func (s *GateServer) handleConnection(conn net.Conn) {
+    session := NewSession(conn)
+    defer session.Close()
+
+    // 读取消息循环
+    for {
+        // 1. 读取消息头（长度+消息ID）
+        header, err := readHeader(conn)
+        if err != nil {
+            return
+        }
+
+        // 2. 读取消息体
+        data, err := readBody(conn, header.Length)
+        if err != nil {
+            return
+        }
+
+        // 3. 根据消息ID路由到对应的处理器
+        if err := s.router.Route(session, header.MsgID, data); err != nil {
+            log.Printf("Route message error: %v", err)
+        }
+    }
+}
+
+// 发送消息到客户端
+func (s *Session) Send(msgID uint32, msg proto.Message) error {
+    data, err := proto.Marshal(msg)
+    if err != nil {
+        return err
+    }
+
+    // 构造消息包（头部+消息体）
+    packet := NewPacket(msgID, data)
+    
+    // 异步发送
+    select {
+    case s.writeChan <- packet:
+        return nil
+    case <-s.ctx.Done():
+        return errors.New("session closed")
+    }
+}
+```
 
 ## 2. 数据模型设计
 
