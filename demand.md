@@ -275,120 +275,284 @@ graph LR
 
 ## 3. 核心功能实现
 
-### 3.1 好友添加流程
-
-```mermaid
-sequenceDiagram
-    participant User1 as 用户A
-    participant API as API Gateway
-    participant FS as Friend Service
-    participant Cache as Redis Cache
-    participant DB as Database
-    participant MQ as Message Queue
-    participant User2 as 用户B
-
-    User1->>API: 发送好友请求
-    API->>FS: 转发请求
-    FS->>Cache: 检查是否已经是好友
-    FS->>DB: 创建好友请求记录
-    FS->>MQ: 发送通知消息
-    MQ->>User2: 推送好友请求通知
-    User2->>API: 接受好友请求
-    API->>FS: 处理接受请求
-    FS->>DB: 创建好友关系
-    FS->>Cache: 更新好友缓存
-    FS->>MQ: 发送成功通知
-    MQ->>User1: 推送添加成功通知
-```
-
-### 3.2 好友状态更新实现
+### 3.1 消息ID定义
 
 ```go
-// StatusService 状态服务
-type StatusService struct {
-    redis  *redis.Client
-    kafka  *kafka.Producer
-    logger *zap.Logger
+const (
+    // 好友相关消息ID
+    MSG_ID_GET_FRIEND_LIST_REQ    = 1001
+    MSG_ID_GET_FRIEND_LIST_RESP   = 1002
+    MSG_ID_ADD_FRIEND_REQ         = 1003
+    MSG_ID_ADD_FRIEND_RESP        = 1004
+    MSG_ID_DEL_FRIEND_REQ         = 1005
+    MSG_ID_DEL_FRIEND_RESP        = 1006
+    MSG_ID_FRIEND_STATUS_NOTIFY   = 1007
+    
+    // 黑名单相关消息ID
+    MSG_ID_ADD_BLACKLIST_REQ      = 1101
+    MSG_ID_ADD_BLACKLIST_RESP     = 1102
+    MSG_ID_DEL_BLACKLIST_REQ      = 1103
+    MSG_ID_DEL_BLACKLIST_RESP     = 1104
+    MSG_ID_GET_BLACKLIST_REQ      = 1105
+    MSG_ID_GET_BLACKLIST_RESP     = 1106
+)
+```
+
+### 3.2 消息处理器实现
+
+```go
+// FriendHandler 好友相关消息处理器
+type FriendHandler struct {
+    friendSvc  *FriendService
+    statusSvc  *StatusService
+    logger     *zap.Logger
 }
 
-// UpdateStatus 更新用户状态
-func (s *StatusService) UpdateStatus(ctx context.Context, userID int64, status *UserStatus) error {
-    // 1. 更新 Redis 缓存
-    key := fmt.Sprintf("user:status:%d", userID)
-    if err := s.redis.HMSet(ctx, key, map[string]interface{}{
-        "status_code":   status.StatusCode,
-        "current_game":  status.CurrentGame,
-        "custom_status": status.CustomStatus,
-        "last_updated": time.Now().Unix(),
-    }).Err(); err != nil {
-        return fmt.Errorf("failed to update redis: %w", err)
-    }
-
-    // 2. 发送状态更新事件到 Kafka
-    event := &StatusUpdateEvent{
-        UserID:    userID,
-        Status:    status,
-        Timestamp: time.Now(),
+// 处理获取好友列表请求
+func (h *FriendHandler) HandleGetFriendList(session *Session, msg *GetFriendListReq) error {
+    resp, err := h.friendSvc.GetFriendList(session.ctx, msg.UserId, msg.PageSize, msg.PageNum)
+    if err != nil {
+        return err
     }
     
-    if err := s.kafka.Produce(ctx, "status-updates", event); err != nil {
-        s.logger.Error("failed to produce kafka message", zap.Error(err))
-        // 不阻塞返回，仅记录日志
-    }
+    // 通过 TCP 连接发送响应
+    return session.Send(MSG_ID_GET_FRIEND_LIST_RESP, resp)
+}
 
+// 处理添加好友请求
+func (h *FriendHandler) HandleAddFriend(session *Session, msg *AddFriendReq) error {
+    // 1. 检查是否在黑名单中
+    if h.friendSvc.IsInBlacklist(session.ctx, msg.FriendId, msg.UserId) {
+        return session.Send(MSG_ID_ADD_FRIEND_RESP, &AddFriendResp{
+            Success: false,
+            Message: "对方已将您加入黑名单",
+        })
+    }
+    
+    // 2. 创建好友请求
+    request, err := h.friendSvc.CreateFriendRequest(session.ctx, msg.UserId, msg.FriendId)
+    if err != nil {
+        return err
+    }
+    
+    // 3. 如果对方在线，推送通知
+    if targetSession := h.getOnlineSession(msg.FriendId); targetSession != nil {
+        targetSession.Send(MSG_ID_FRIEND_REQUEST_NOTIFY, &FriendRequestNotify{
+            Request: request,
+        })
+    }
+    
+    return session.Send(MSG_ID_ADD_FRIEND_RESP, &AddFriendResp{
+        Success: true,
+        Request: request,
+    })
+}
+```
+
+### 3.3 好友服务实现
+
+```go
+// FriendService 好友服务
+type FriendService struct {
+    db         *gorm.DB
+    redis      *redis.Client
+    logger     *zap.Logger
+}
+
+// GetFriendList 获取好友列表
+func (s *FriendService) GetFriendList(ctx context.Context, userID int64, pageSize, pageNum int32) (*GetFriendListResp, error) {
+    // 1. 尝试从缓存获取
+    cacheKey := fmt.Sprintf("friend:list:%d", userID)
+    if data, err := s.redis.Get(ctx, cacheKey).Result(); err == nil {
+        var resp GetFriendListResp
+        if err := json.Unmarshal([]byte(data), &resp); err == nil {
+            return &resp, nil
+        }
+    }
+    
+    // 2. 从数据库查询
+    var friends []Friendship
+    offset := (pageNum - 1) * pageSize
+    if err := s.db.Where("user_id = ?", userID).
+        Offset(int(offset)).
+        Limit(int(pageSize)).
+        Find(&friends).Error; err != nil {
+        return nil, err
+    }
+    
+    // 3. 查询好友详细信息
+    resp := &GetFriendListResp{
+        Friends: make([]*FriendInfoProto, 0, len(friends)),
+    }
+    
+    for _, f := range friends {
+        info, err := s.getUserInfo(ctx, f.FriendID)
+        if err != nil {
+            continue
+        }
+        resp.Friends = append(resp.Friends, info)
+    }
+    
+    // 4. 更新缓存
+    if data, err := json.Marshal(resp); err == nil {
+        s.redis.Set(ctx, cacheKey, data, time.Minute*5)
+    }
+    
+    return resp, nil
+}
+
+// IsInBlacklist 检查是否在黑名单中
+func (s *FriendService) IsInBlacklist(ctx context.Context, userID, targetID int64) bool {
+    cacheKey := fmt.Sprintf("blacklist:%d", userID)
+    return s.redis.SIsMember(ctx, cacheKey, targetID).Val()
+}
+
+// AddToBlacklist 添加到黑名单
+func (s *FriendService) AddToBlacklist(ctx context.Context, userID, targetID int64) error {
+    // 1. 添加到数据库
+    blacklist := &Blacklist{
+        UserID:    userID,
+        TargetID:  targetID,
+        CreatedAt: time.Now(),
+    }
+    
+    if err := s.db.Create(blacklist).Error; err != nil {
+        return err
+    }
+    
+    // 2. 更新缓存
+    cacheKey := fmt.Sprintf("blacklist:%d", userID)
+    s.redis.SAdd(ctx, cacheKey, targetID)
+    
+    // 3. 如果是好友关系，则删除好友关系
+    if err := s.db.Where("user_id = ? AND friend_id = ?", userID, targetID).
+        Or("user_id = ? AND friend_id = ?", targetID, userID).
+        Delete(&Friendship{}).Error; err != nil {
+        s.logger.Error("failed to delete friendship", zap.Error(err))
+    }
+    
+    // 4. 删除好友缓存
+    s.redis.Del(ctx, fmt.Sprintf("friend:list:%d", userID))
+    s.redis.Del(ctx, fmt.Sprintf("friend:list:%d", targetID))
+    
     return nil
 }
 ```
 
-### 3.3 好友推荐系统
-
-```mermaid
-graph TD
-    A[数据收集] --> B[特征提取]
-    B --> C[相似度计算]
-    C --> D[推荐结果生成]
-    B --> E[游戏偏好]
-    B --> F[共同好友]
-    B --> G[互动频率]
-    E --> C
-    F --> C
-    G --> C
-```
-
-推荐系统实现示例：
+### 3.4 在线状态管理
 
 ```go
-// RecommendationService 推荐服务
-type RecommendationService struct {
-    redis      *redis.Client
-    db         *gorm.DB
-    logger     *zap.Logger
+// StatusManager 在线状态管理器
+type StatusManager struct {
+    sessions    sync.Map // userID -> *Session
+    redis       *redis.Client
+    logger      *zap.Logger
 }
 
-// GetRecommendations 获取好友推荐
-func (s *RecommendationService) GetRecommendations(ctx context.Context, userID int64) ([]*RecommendedFriend, error) {
-    // 1. 尝试从缓存获取
-    cacheKey := fmt.Sprintf("friend:recommendations:%d", userID)
-    if cached, err := s.redis.Get(ctx, cacheKey).Result(); err == nil {
-        var recommendations []*RecommendedFriend
-        if err := json.Unmarshal([]byte(cached), &recommendations); err == nil {
-            return recommendations, nil
+// OnUserOnline 处理用户上线
+func (m *StatusManager) OnUserOnline(session *Session) {
+    // 1. 保存会话信息
+    m.sessions.Store(session.UserID, session)
+    
+    // 2. 更新用户状态
+    status := &UserStatus{
+        UserID:    session.UserID,
+        Status:    STATUS_ONLINE,
+        UpdatedAt: time.Now().Unix(),
+    }
+    
+    if err := m.updateStatus(session.ctx, status); err != nil {
+        m.logger.Error("failed to update status", zap.Error(err))
+        return
+    }
+    
+    // 3. 通知好友上线
+    friends, _ := m.getFriendIDs(session.UserID)
+    for _, friendID := range friends {
+        if s, ok := m.sessions.Load(friendID); ok {
+            s.(*Session).Send(MSG_ID_FRIEND_STATUS_NOTIFY, &FriendStatusNotify{
+                UserID:    session.UserID,
+                Status:    STATUS_ONLINE,
+                UpdatedAt: status.UpdatedAt,
+            })
         }
     }
-
-    // 2. 计算推荐
-    recommendations, err := s.computeRecommendations(ctx, userID)
-    if err != nil {
-        return nil, err
-    }
-
-    // 3. 更新缓存
-    if data, err := json.Marshal(recommendations); err == nil {
-        s.redis.Set(ctx, cacheKey, data, time.Hour)
-    }
-
-    return recommendations, nil
 }
+
+// OnUserOffline 处理用户下线
+func (m *StatusManager) OnUserOffline(session *Session) {
+    // 1. 移除会话信息
+    m.sessions.Delete(session.UserID)
+    
+    // 2. 更新用户状态
+    status := &UserStatus{
+        UserID:    session.UserID,
+        Status:    STATUS_OFFLINE,
+        UpdatedAt: time.Now().Unix(),
+    }
+    
+    if err := m.updateStatus(session.ctx, status); err != nil {
+        m.logger.Error("failed to update status", zap.Error(err))
+        return
+    }
+    
+    // 3. 通知好友下线
+    friends, _ := m.getFriendIDs(session.UserID)
+    for _, friendID := range friends {
+        if s, ok := m.sessions.Load(friendID); ok {
+            s.(*Session).Send(MSG_ID_FRIEND_STATUS_NOTIFY, &FriendStatusNotify{
+                UserID:    session.UserID,
+                Status:    STATUS_OFFLINE,
+                UpdatedAt: status.UpdatedAt,
+            })
+        }
+    }
+}
+```
+
+### 3.5 黑名单数据结构
+
+```protobuf
+// 黑名单相关消息
+message BlacklistUserInfo {
+    int64 user_id = 1;
+    string username = 2;
+    int64 created_at = 3;
+}
+
+message AddToBlacklistReq {
+    int64 user_id = 1;
+    int64 target_id = 2;
+}
+
+message AddToBlacklistResp {
+    bool success = 1;
+    string message = 2;
+}
+
+message GetBlacklistReq {
+    int64 user_id = 1;
+    int32 page_size = 2;
+    int32 page_num = 3;
+}
+
+message GetBlacklistResp {
+    repeated BlacklistUserInfo users = 1;
+    int32 total_count = 2;
+}
+```
+
+```sql
+-- 黑名单表
+CREATE TABLE blacklist (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    user_id BIGINT NOT NULL,
+    target_id BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_blacklist (user_id, target_id),
+    INDEX idx_user_id (user_id),
+    INDEX idx_target_id (target_id)
+);
 ```
 
 ## 4. 性能优化策略
