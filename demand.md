@@ -555,6 +555,294 @@ CREATE TABLE blacklist (
 );
 ```
 
+### 3.6 好友搜索和排序
+
+```go
+// FriendSearchOptions 好友搜索选项
+type FriendSearchOptions struct {
+    Keyword    string    // 搜索关键词
+    GroupID    int64     // 分组ID
+    Status     int8      // 在线状态
+    SortBy     string    // 排序字段：last_active, username
+    SortOrder  string    // 排序顺序：asc, desc
+}
+
+// SearchFriends 搜索好友
+func (s *FriendService) SearchFriends(ctx context.Context, userID int64, opts *FriendSearchOptions) ([]*FriendInfoProto, error) {
+    query := s.db.Table("friendships f").
+        Joins("JOIN users u ON f.friend_id = u.user_id").
+        Where("f.user_id = ?", userID)
+    
+    // 关键词搜索
+    if opts.Keyword != "" {
+        query = query.Where("u.username LIKE ?", "%"+opts.Keyword+"%")
+    }
+    
+    // 分组过滤
+    if opts.GroupID > 0 {
+        query = query.Where("f.group_id = ?", opts.GroupID)
+    }
+    
+    // 状态过滤
+    if opts.Status > 0 {
+        query = query.Where("u.status_code = ?", opts.Status)
+    }
+    
+    // 排序
+    if opts.SortBy != "" {
+        order := opts.SortBy
+        if opts.SortOrder == "desc" {
+            order += " DESC"
+        }
+        query = query.Order(order)
+    }
+    
+    var friends []*FriendInfoProto
+    if err := query.Find(&friends).Error; err != nil {
+        return nil, err
+    }
+    
+    return friends, nil
+}
+```
+
+### 3.7 好友分组管理
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gate
+    participant FriendSvc
+    participant DB
+    participant Cache
+
+    Client->>Gate: 创建分组请求
+    Gate->>FriendSvc: 路由到好友服务
+    FriendSvc->>DB: 创建分组记录
+    FriendSvc->>Cache: 更新分组缓存
+    FriendSvc-->>Client: 返回结果
+
+    Client->>Gate: 移动好友到分组
+    Gate->>FriendSvc: 路由到好友服务
+    FriendSvc->>DB: 更新好友分组
+    FriendSvc->>Cache: 更新好友列表缓存
+    FriendSvc-->>Client: 返回结果
+```
+
+```go
+// FriendGroupService 好友分组服务
+type FriendGroupService struct {
+    db     *gorm.DB
+    redis  *redis.Client
+    logger *zap.Logger
+}
+
+// CreateGroup 创建好友分组
+func (s *FriendGroupService) CreateGroup(ctx context.Context, userID int64, groupName string) (*FriendGroup, error) {
+    group := &FriendGroup{
+        UserID:    userID,
+        GroupName: groupName,
+        CreatedAt: time.Now(),
+    }
+    
+    if err := s.db.Create(group).Error; err != nil {
+        return nil, err
+    }
+    
+    // 更新缓存
+    s.updateGroupCache(ctx, userID)
+    return group, nil
+}
+
+// MoveFriendToGroup 移动好友到指定分组
+func (s *FriendGroupService) MoveFriendToGroup(ctx context.Context, userID, friendID, groupID int64) error {
+    if err := s.db.Model(&Friendship{}).
+        Where("user_id = ? AND friend_id = ?", userID, friendID).
+        Update("group_id", groupID).Error; err != nil {
+        return err
+    }
+    
+    // 更新缓存
+    s.redis.Del(ctx, fmt.Sprintf("friend:list:%d", userID))
+    return nil
+}
+```
+
+### 3.8 好友推荐系统
+
+```mermaid
+graph TD
+    A[数据收集] --> B[特征提取]
+    B --> C[相似度计算]
+    C --> D[推荐结果生成]
+    
+    B --> E[游戏偏好分析]
+    B --> F[共同好友统计]
+    B --> G[游戏时长统计]
+    B --> H[互动频率分析]
+    
+    E --> I[游戏标签匹配]
+    F --> J[社交关系强度]
+    G --> K[活跃度匹配]
+    H --> L[互动意愿预测]
+    
+    I --> C
+    J --> C
+    K --> C
+    L --> C
+```
+
+```go
+// RecommendationService 好友推荐服务
+type RecommendationService struct {
+    db     *gorm.DB
+    redis  *redis.Client
+    logger *zap.Logger
+}
+
+// RecommendationReason 推荐原因
+type RecommendationReason struct {
+    Type        string  // 推荐类型：common_friends, similar_games, active_time
+    Score       float64 // 相似度得分
+    Description string  // 推荐原因描述
+}
+
+// FriendRecommendation 好友推荐
+type FriendRecommendation struct {
+    User    *UserInfo
+    Reasons []*RecommendationReason
+    Score   float64
+}
+
+// GetRecommendations 获取好友推荐
+func (s *RecommendationService) GetRecommendations(ctx context.Context, userID int64) ([]*FriendRecommendation, error) {
+    // 1. 获取用户特征
+    userFeatures, err := s.getUserFeatures(ctx, userID)
+    if err != nil {
+        return nil, err
+    }
+    
+    // 2. 获取候选用户
+    candidates, err := s.getCandidateUsers(ctx, userID)
+    if err != nil {
+        return nil, err
+    }
+    
+    // 3. 计算相似度和推荐原因
+    recommendations := make([]*FriendRecommendation, 0)
+    for _, candidate := range candidates {
+        // 计算共同好友
+        commonFriends, err := s.getCommonFriends(ctx, userID, candidate.UserID)
+        if err != nil {
+            continue
+        }
+        
+        // 计算游戏偏好相似度
+        gameSimilarity, err := s.calculateGameSimilarity(ctx, userID, candidate.UserID)
+        if err != nil {
+            continue
+        }
+        
+        // 计算活跃时间重叠度
+        activeTimeOverlap, err := s.calculateActiveTimeOverlap(ctx, userID, candidate.UserID)
+        if err != nil {
+            continue
+        }
+        
+        // 生成推荐原因
+        reasons := []*RecommendationReason{
+            {
+                Type:        "common_friends",
+                Score:       float64(len(commonFriends)) * 0.4,
+                Description: fmt.Sprintf("有%d个共同好友", len(commonFriends)),
+            },
+            {
+                Type:        "similar_games",
+                Score:       gameSimilarity * 0.4,
+                Description: "有相似的游戏兴趣",
+            },
+            {
+                Type:        "active_time",
+                Score:       activeTimeOverlap * 0.2,
+                Description: "经常在相同时间在线",
+            },
+        }
+        
+        // 计算总分
+        totalScore := 0.0
+        for _, reason := range reasons {
+            totalScore += reason.Score
+        }
+        
+        recommendations = append(recommendations, &FriendRecommendation{
+            User:    candidate,
+            Reasons: reasons,
+            Score:   totalScore,
+        })
+    }
+    
+    // 4. 排序
+    sort.Slice(recommendations, func(i, j int) bool {
+        return recommendations[i].Score > recommendations[j].Score
+    })
+    
+    return recommendations[:min(10, len(recommendations))], nil
+}
+```
+
+### 3.9 通过用户名添加好友
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gate
+    participant FriendSvc
+    participant DB
+    participant Cache
+
+    Client->>Gate: 搜索用户请求
+    Gate->>FriendSvc: 路由到好友服务
+    FriendSvc->>DB: 模糊搜索用户
+    DB-->>FriendSvc: 返回匹配用户
+    FriendSvc-->>Client: 返回搜索结果
+
+    Client->>Gate: 发送好友请求
+    Gate->>FriendSvc: 路由到好友服务
+    FriendSvc->>DB: 创建好友请求
+    FriendSvc->>Gate: 推送通知
+    Gate-->>Client: 返回结果
+```
+
+```go
+// SearchUsers 搜索用户
+func (s *FriendService) SearchUsers(ctx context.Context, keyword string) ([]*UserInfo, error) {
+    var users []*UserInfo
+    if err := s.db.Where("username LIKE ?", "%"+keyword+"%").
+        Limit(20).
+        Find(&users).Error; err != nil {
+        return nil, err
+    }
+    return users, nil
+}
+
+// AddFriendByUsername 通过用户名添加好友
+func (s *FriendService) AddFriendByUsername(ctx context.Context, userID int64, username string) error {
+    // 1. 查找目标用户
+    var target User
+    if err := s.db.Where("username = ?", username).First(&target).Error; err != nil {
+        return err
+    }
+    
+    // 2. 检查是否已经是好友
+    if s.IsFriend(ctx, userID, target.UserID) {
+        return errors.New("already friends")
+    }
+    
+    // 3. 创建好友请求
+    return s.CreateFriendRequest(ctx, userID, target.UserID)
+}
+```
+
 ## 4. 性能优化策略
 
 ### 4.1 缓存策略
