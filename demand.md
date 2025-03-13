@@ -10,13 +10,13 @@ graph TD
     A[Gate Server] --> B[Friend Service]
     A --> C[Status Service]
     A --> D[Recommendation Service]
-    B --> E[Redis Cache]
+    
+    B --> E[Redis Cluster]
     B --> F[MySQL Master]
     F --> G[MySQL Slave]
-    B --> H[Kafka]
+    
     C --> E
     D --> E
-    H --> I[Notification Service]
     
     Client1[游戏客户端] -.TCP.-> A
     Client2[游戏客户端] -.TCP.-> A
@@ -28,14 +28,98 @@ graph TD
 ```
 
 ### 1.2 核心组件
-1. **Gate Server**: TCP 网关服务器，负责维护客户端连接和消息路由
-2. **Friend Service**: 好友关系管理核心服务
-3. **Status Service**: 在线状态管理服务
-4. **Recommendation Service**: 好友推荐服务
-5. **Cache Layer**: 使用 Redis 集群作为缓存层
-6. **Message Queue**: 使用 Kafka 作为消息队列
 
-### 1.3 通信协议定义 (Protobuf)
+1. **Gate Server（网关服务器）**
+   - 维护与游戏客户端的 TCP 长连接
+   - 处理消息的编解码（Protobuf）
+   - 实现消息路由分发
+   - 管理用户会话（Session）
+   - 处理心跳保活
+
+2. **Friend Service（好友服务）**
+   - 处理好友关系管理
+   - 好友分组管理
+   - 好友请求处理
+   - 黑名单管理
+   - 好友列表查询和搜索
+
+3. **Status Service（状态服务）**
+   - 维护用户在线状态
+   - 处理状态变更通知
+   - 管理用户游戏状态
+   - 状态广播给好友
+
+4. **Recommendation Service（推荐服务）**
+   - 收集用户行为数据
+   - 计算用户相似度
+   - 生成好友推荐
+   - 推荐原因分析
+
+5. **Redis Cluster（缓存集群）**
+   - 好友列表缓存
+   - 用户状态缓存
+   - 好友请求缓存
+   - 黑名单缓存
+   - 游戏偏好缓存
+   - 分布式锁服务
+
+6. **MySQL（数据存储）**
+   - 主从架构
+   - 存储用户数据
+   - 存储好友关系
+   - 存储历史记录
+   - 数据持久化
+
+### 1.3 服务通信流程
+
+```mermaid
+sequenceDiagram
+    participant Client as 游戏客户端
+    participant Gate as Gate Server
+    participant Friend as Friend Service
+    participant Status as Status Service
+    participant Redis as Redis Cluster
+    participant DB as MySQL
+
+    Client->>Gate: 1. 建立TCP连接
+    Gate->>Status: 2. 创建会话&更新状态
+    Status->>Redis: 3. 缓存状态
+    Status->>DB: 4. 持久化状态
+    
+    Client->>Gate: 5. 发送业务请求
+    Gate->>Friend: 6. 路由到对应服务
+    Friend->>Redis: 7. 查询缓存
+    Friend->>DB: 8. 数据持久化
+    Friend-->>Client: 9. 返回响应
+```
+
+### 1.4 关键技术点
+
+1. **长连接管理**
+   - 使用 goroutine 处理每个连接
+   - 心跳机制保活
+   - 连接断开自动重连
+   - 会话状态维护
+
+2. **数据一致性**
+   - 分布式锁控制并发
+   - 缓存更新策略
+   - 数据库主从同步
+   - 状态同步机制
+
+3. **高可用设计**
+   - 服务无状态设计
+   - 多实例部署
+   - 故障自动转移
+   - 容灾备份方案
+
+4. **性能优化**
+   - 连接池管理
+   - 批量处理机制
+   - 异步处理模型
+   - 多级缓存策略
+
+### 1.5 通信协议定义 (Protobuf)
 
 ```protobuf
 syntax = "proto3";
@@ -103,7 +187,7 @@ service FriendService {
 }
 ```
 
-### 1.4 网关服务实现
+### 1.6 网关服务实现
 
 ```go
 // GateServer TCP网关服务器
