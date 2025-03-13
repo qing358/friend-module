@@ -249,6 +249,7 @@ service FriendService {
     rpc CreateGroup(CreateGroupReq) returns (CreateGroupResp);
     rpc MoveFriendToGroup(MoveFriendToGroupReq) returns (MoveFriendToGroupResp);
 }
+```
 
 #### 1.5.3 好友管理模块
 ```protobuf
@@ -1003,6 +1004,7 @@ func (s *FriendService) CreateFriendRequest(ctx context.Context, userID, targetI
     
     return nil
 }
+```
 
 #### 3.1.3 好友列表获取流程
 
