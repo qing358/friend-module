@@ -179,11 +179,47 @@ message FriendStatusNotify {
     int64 updated_at = 5;
 }
 
+// 好友分组信息
+message FriendGroupProto {
+    int64 group_id = 1;
+    int64 user_id = 2;
+    string group_name = 3;
+    int64 created_at = 4;
+}
+
+// 创建分组请求
+message CreateGroupReq {
+    int64 user_id = 1;
+    string group_name = 2;
+}
+
+// 创建分组响应
+message CreateGroupResp {
+    bool success = 1;
+    string message = 2;
+    FriendGroupProto group = 3;
+}
+
+// 移动好友到分组请求
+message MoveFriendToGroupReq {
+    int64 user_id = 1;
+    int64 friend_id = 2;
+    int64 group_id = 3;
+}
+
+// 移动好友到分组响应
+message MoveFriendToGroupResp {
+    bool success = 1;
+    string message = 2;
+}
+
 // 服务定义
 service FriendService {
     rpc GetFriendList(GetFriendListReq) returns (GetFriendListResp);
     rpc AddFriend(AddFriendReq) returns (AddFriendResp);
     rpc UpdateStatus(FriendStatusNotify) returns (google.protobuf.Empty);
+    rpc CreateGroup(CreateGroupReq) returns (CreateGroupResp);
+    rpc MoveFriendToGroup(MoveFriendToGroupReq) returns (MoveFriendToGroupResp);
 }
 ```
 
@@ -617,24 +653,38 @@ sequenceDiagram
     participant Client
     participant Gate
     participant FriendSvc
-    participant DB
     participant Cache
-
-    Client->>Gate: 搜索用户请求
-    Gate->>FriendSvc: 路由到好友服务
-    FriendSvc->>DB: 模糊搜索用户
-    DB-->>FriendSvc: 返回匹配用户
-    FriendSvc-->>Client: 返回搜索结果
+    participant DB
 
     Client->>Gate: 发送好友请求
     Gate->>FriendSvc: 路由到好友服务
+    
+    FriendSvc->>DB: 查找目标用户
+    DB-->>FriendSvc: 返回用户信息
+    
+    FriendSvc->>Cache: 检查好友关系
+    alt 缓存未命中
+        FriendSvc->>DB: 查询好友关系
+    end
+    
+    FriendSvc->>Cache: 检查黑名单
+    alt 缓存未命中
+        FriendSvc->>DB: 查询黑名单
+    end
+    
+    FriendSvc->>Cache: 获取分布式锁
+    
     FriendSvc->>DB: 创建好友请求
-    FriendSvc->>Gate: 推送通知
-    Gate-->>Client: 返回结果
+    FriendSvc->>Cache: 更新请求缓存
+    
+    FriendSvc->>Gate: 推送通知给目标用户
+    Gate-->>Client: 返回处理结果
+    
+    FriendSvc->>Cache: 释放分布式锁
 ```
 
 ```go
-// 通过用户名或ID添加好友
+// AddFriend 通过用户名或ID添加好友
 func (s *FriendService) AddFriend(ctx context.Context, userID int64, target string) error {
     // 1. 判断是通过用户名还是ID添加
     var targetUser User
@@ -662,6 +712,65 @@ func (s *FriendService) AddFriend(ctx context.Context, userID int64, target stri
     
     // 4. 创建好友请求
     return s.CreateFriendRequest(ctx, userID, targetUser.UserID)
+}
+
+// DeleteFriend 删除好友关系
+func (s *FriendService) DeleteFriend(ctx context.Context, userID, friendID int64) error {
+    // 1. 获取分布式锁
+    lockKey := fmt.Sprintf(CACHE_KEY_LOCK_FRIEND, userID, friendID)
+    lock := s.redisLock.NewLock(lockKey, time.Second*30)
+    if err := lock.Lock(); err != nil {
+        return fmt.Errorf("failed to acquire lock: %w", err)
+    }
+    defer lock.Unlock()
+
+    // 2. 开启事务删除双向好友关系
+    tx := s.db.Begin()
+    if err := tx.Where("(user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)",
+        userID, friendID, friendID, userID).Delete(&Friendship{}).Error; err != nil {
+        tx.Rollback()
+        return fmt.Errorf("failed to delete friendship: %w", err)
+    }
+    if err := tx.Commit().Error; err != nil {
+        return fmt.Errorf("failed to commit transaction: %w", err)
+    }
+
+    // 3. 使用Pipeline批量更新缓存
+    pipe := s.redis.Pipeline()
+    
+    // 删除双方的好友缓存
+    pipe.Del(ctx, fmt.Sprintf(CACHE_KEY_FRIEND_LIST, userID))
+    pipe.Del(ctx, fmt.Sprintf(CACHE_KEY_FRIEND_LIST, friendID))
+    
+    // 从好友集合中移除
+    pipe.SRem(ctx, fmt.Sprintf("friend:set:%d", userID), friendID)
+    pipe.SRem(ctx, fmt.Sprintf("friend:set:%d", friendID), userID)
+    
+    // 执行Pipeline操作
+    if _, err := pipe.Exec(ctx); err != nil {
+        s.logger.Error("failed to update friend cache",
+            zap.Error(err),
+            zap.Int64("user_id", userID),
+            zap.Int64("friend_id", friendID))
+    }
+
+    // 4. 发送好友关系变更通知
+    go func() {
+        // 通知用户A
+        if session, ok := s.sessions.Load(userID); ok {
+            session.(*Session).Send(MSG_ID_DEL_FRIEND_RESP, &struct {
+                FriendID int64 `json:"friend_id"`
+            }{FriendID: friendID})
+        }
+        // 通知用户B
+        if session, ok := s.sessions.Load(friendID); ok {
+            session.(*Session).Send(MSG_ID_DEL_FRIEND_RESP, &struct {
+                FriendID int64 `json:"friend_id"`
+            }{FriendID: userID})
+        }
+    }()
+
+    return nil
 }
 
 // IsFriend 检查两个用户是否已经是好友
@@ -711,7 +820,7 @@ func (s *FriendService) CreateFriendRequest(ctx context.Context, userID, targetI
     
     // 2. 创建好友请求
     request := &FriendRequest{
-        RequestID:  generateID(), // 生成唯一ID
+        RequestID:  generateID(),
         SenderID:   userID,
         ReceiverID: targetID,
         Status:     FRIEND_REQUEST_PENDING,
@@ -753,64 +862,51 @@ sequenceDiagram
     Client->>Gate: 获取好友列表请求
     Gate->>FriendSvc: 路由到好友服务
     
+    FriendSvc->>Cache: 查询缓存
     alt 缓存存在
-        FriendSvc->>Cache: 查询缓存
         Cache-->>FriendSvc: 返回好友列表
+        FriendSvc-->>Client: 直接返回缓存数据
     else 缓存不存在
-        FriendSvc->>DB: 查询数据库
-        DB-->>FriendSvc: 返回好友数据
+        FriendSvc->>DB: 构建查询（包含过滤条件）
+        Note over FriendSvc,DB: 包含：关键词搜索、分组过滤、状态过滤、排序
+        DB-->>FriendSvc: 返回过滤后的好友数据
         FriendSvc->>Cache: 更新缓存
+        FriendSvc-->>Client: 返回好友列表
     end
-    
-    alt 有搜索条件
-        FriendSvc->>FriendSvc: 应用搜索过滤
-    end
-    
-    alt 有分组过滤
-        FriendSvc->>FriendSvc: 应用分组过滤
-    end
-    
-    alt 有状态过滤
-        FriendSvc->>FriendSvc: 应用状态过滤
-    end
-    
-    FriendSvc->>FriendSvc: 排序处理
-    FriendSvc-->>Client: 返回好友列表
 ```
 
 ```go
 // 获取好友列表（支持分组和搜索）
 func (s *FriendService) GetFriendList(ctx context.Context, userID int64, opts *FriendSearchOptions) (*GetFriendListResp, error) {
-    // 1. 尝试从缓存获取
+    // 1. 尝试从缓存获取完整好友列表
+    var friends []*FriendInfoProto
     cacheKey := fmt.Sprintf("friend:list:%d", userID)
     if data, err := s.redis.Get(ctx, cacheKey).Result(); err == nil {
-        var resp GetFriendListResp
-        if err := json.Unmarshal([]byte(data), &resp); err == nil {
-            return &resp, nil
+        if err := json.Unmarshal([]byte(data), &friends); err == nil {
+            // 对缓存数据应用过滤
+            friends = applyFilters(friends, opts)
+            return &GetFriendListResp{
+                Friends: friends,
+                TotalCount: int32(len(friends)),
+            }, nil
         }
     }
     
-    // 2. 从数据库查询
+    // 2. 缓存未命中，从数据库查询
     query := s.db.Table("friendships f").
         Joins("JOIN users u ON f.friend_id = u.user_id").
         Where("f.user_id = ?", userID)
     
-    // 关键词搜索
+    // 应用过滤条件
     if opts.Keyword != "" {
         query = query.Where("u.username LIKE ?", "%"+opts.Keyword+"%")
     }
-    
-    // 分组过滤
     if opts.GroupID > 0 {
         query = query.Where("f.group_id = ?", opts.GroupID)
     }
-    
-    // 状态过滤
     if opts.Status > 0 {
         query = query.Where("u.status_code = ?", opts.Status)
     }
-    
-    // 排序
     if opts.SortBy != "" {
         order := opts.SortBy
         if opts.SortOrder == "desc" {
@@ -819,22 +915,22 @@ func (s *FriendService) GetFriendList(ctx context.Context, userID int64, opts *F
         query = query.Order(order)
     }
     
-    var friends []*FriendInfoProto
     if err := query.Find(&friends).Error; err != nil {
         return nil, err
     }
     
-    resp := &GetFriendListResp{
-        Friends: friends,
-        TotalCount: int32(len(friends)),
-    }
-    
     // 3. 更新缓存
-    if data, err := json.Marshal(resp); err == nil {
+    if data, err := json.Marshal(friends); err == nil {
         s.redis.Set(ctx, cacheKey, data, time.Minute*5)
     }
     
-    return resp, nil
+    // 对结果应用过滤
+    friends = applyFilters(friends, opts)
+    
+    return &GetFriendListResp{
+        Friends: friends,
+        TotalCount: int32(len(friends)),
+    }, nil
 }
 ```
 
@@ -891,6 +987,51 @@ func (s *FriendGroupService) CreateGroup(ctx context.Context, userID int64, grou
     // 更新缓存
     s.updateGroupCache(ctx, userID)
     return group, nil
+}
+
+// updateGroupCache 更新用户的好友分组缓存
+func (s *FriendGroupService) updateGroupCache(ctx context.Context, userID int64) error {
+    // 1. 从数据库获取最新的分组列表
+    var groups []*FriendGroup
+    if err := s.db.Where("user_id = ?", userID).Find(&groups).Error; err != nil {
+        s.logger.Error("failed to get groups from db",
+            zap.Error(err),
+            zap.Int64("user_id", userID))
+        return err
+    }
+    
+    // 2. 序列化分组数据
+    groupData, err := json.Marshal(groups)
+    if err != nil {
+        s.logger.Error("failed to marshal groups",
+            zap.Error(err),
+            zap.Int64("user_id", userID))
+        return err
+    }
+    
+    // 3. 使用Pipeline批量更新缓存
+    pipe := s.redis.Pipeline()
+    
+    // 更新分组列表缓存
+    cacheKey := fmt.Sprintf(CACHE_KEY_FRIEND_GROUPS, userID)
+    pipe.Set(ctx, cacheKey, groupData, time.Hour*24)
+    
+    // 将分组ID添加到用户的分组集合中
+    groupSetKey := fmt.Sprintf("user:groups:%d", userID)
+    pipe.Del(ctx, groupSetKey)
+    for _, group := range groups {
+        pipe.SAdd(ctx, groupSetKey, group.GroupID)
+    }
+    
+    // 执行Pipeline操作
+    if _, err := pipe.Exec(ctx); err != nil {
+        s.logger.Error("failed to update group cache",
+            zap.Error(err),
+            zap.Int64("user_id", userID))
+        return err
+    }
+    
+    return nil
 }
 
 // MoveFriendToGroup 移动好友到指定分组
