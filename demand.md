@@ -227,11 +227,70 @@ CREATE TABLE user_status (
     last_updated TIMESTAMP,
     INDEX idx_last_updated (last_updated)
 );
+
+-- 游戏偏好表（用于好友推荐）
+CREATE TABLE user_game_preferences (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    game_id BIGINT NOT NULL,
+    play_time INT NOT NULL,  -- 游戏时长（分钟）
+    last_played TIMESTAMP,   -- 最后一次游戏时间
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_user_game (user_id, game_id),
+    INDEX idx_last_played (last_played)
+);
+
+-- 用户互动记录表（用于好友推荐）
+CREATE TABLE user_interactions (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    target_id BIGINT NOT NULL,
+    interaction_type TINYINT NOT NULL, -- 1:聊天 2:组队 3:交易等
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_user_target (user_id, target_id),
+    INDEX idx_created_at (created_at)
+);
+
+-- 黑名单表
+CREATE TABLE blacklist (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    target_id BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_blacklist (user_id, target_id),
+    INDEX idx_user_id (user_id),
+    INDEX idx_target_id (target_id)
+);
 ```
 
 ### 2.2 数据结构定义 (Golang)
 
 ```go
+// 状态码常量
+const (
+    STATUS_OFFLINE = iota
+    STATUS_ONLINE
+    STATUS_AWAY
+    STATUS_BUSY
+    STATUS_INVISIBLE
+)
+
+// 互动类型常量
+const (
+    INTERACTION_CHAT = iota + 1
+    INTERACTION_TEAM
+    INTERACTION_TRADE
+    INTERACTION_GIFT
+    INTERACTION_PVP
+)
+
+// 好友请求状态常量
+const (
+    FRIEND_REQUEST_PENDING = iota
+    FRIEND_REQUEST_ACCEPTED
+    FRIEND_REQUEST_REJECTED
+)
+
 // 用户信息
 type User struct {
     UserID    int64     `json:"user_id"`
@@ -258,6 +317,87 @@ type FriendRequest struct {
     Status     int8      `json:"status"`
     CreatedAt  time.Time `json:"created_at"`
 }
+
+// 游戏偏好信息
+type GamePreference struct {
+    ID         int64     `json:"id"`
+    UserID     int64     `json:"user_id"`
+    GameID     int64     `json:"game_id"`
+    PlayTime   int       `json:"play_time"`
+    LastPlayed time.Time `json:"last_played"`
+    CreatedAt  time.Time `json:"created_at"`
+}
+
+// 用户互动记录
+type UserInteraction struct {
+    ID             int64     `json:"id"`
+    UserID         int64     `json:"user_id"`
+    TargetID       int64     `json:"target_id"`
+    InteractionType int8      `json:"interaction_type"`
+    CreatedAt      time.Time `json:"created_at"`
+}
+
+// 黑名单记录
+type Blacklist struct {
+    ID        int64     `json:"id"`
+    UserID    int64     `json:"user_id"`
+    TargetID  int64     `json:"target_id"`
+    CreatedAt time.Time `json:"created_at"`
+}
+
+// 用户状态
+type UserStatus struct {
+    UserID       int64     `json:"user_id"`
+    Status       int8      `json:"status"`
+    CurrentGame  string    `json:"current_game"`
+    CustomStatus string    `json:"custom_status"`
+    UpdatedAt    int64     `json:"updated_at"`
+}
+
+// 好友分组
+type FriendGroup struct {
+    GroupID    int64     `json:"group_id"`
+    UserID     int64     `json:"user_id"`
+    GroupName  string    `json:"group_name"`
+    CreatedAt  time.Time `json:"created_at"`
+}
+
+// 游戏信息
+type GameInfo struct {
+    GameID      int64     `json:"game_id"`
+    GameName    string    `json:"game_name"`
+    GameTags    []string  `json:"game_tags"`
+    CreatedAt   time.Time `json:"created_at"`
+}
+
+// 用户特征
+type UserFeatures struct {
+    UserID          int64             `json:"user_id"`
+    GamePreferences []*GamePreference `json:"game_preferences"`
+    ActiveTimeSlots []int32          `json:"active_time_slots"` // 24小时制的活跃时间段
+    InteractionStats map[string]int   `json:"interaction_stats"` // 各类互动的统计
+}
+
+// 搜索选项
+type FriendSearchOptions struct {
+    Keyword    string    `json:"keyword"`     // 搜索关键词
+    GroupID    int64     `json:"group_id"`    // 分组ID
+    Status     int8      `json:"status"`      // 在线状态过滤
+    SortBy     string    `json:"sort_by"`     // 排序字段
+    SortOrder  string    `json:"sort_order"`  // 排序顺序
+    PageSize   int32     `json:"page_size"`   // 分页大小
+    PageNum    int32     `json:"page_num"`    // 页码
+}
+
+// 用户基本信息
+type UserInfo struct {
+    UserID       int64     `json:"user_id"`
+    Username     string    `json:"username"`
+    Status       int8      `json:"status"`
+    CurrentGame  string    `json:"current_game"`
+    CustomStatus string    `json:"custom_status"`
+    LastActive   time.Time `json:"last_active"`
+}
 ```
 
 ### 2.3 缓存设计
@@ -268,10 +408,91 @@ graph LR
     A[Redis Cluster] --> B[好友列表缓存]
     A --> C[用户状态缓存]
     A --> D[好友请求缓存]
-    B --> E[Sorted Set]
-    C --> F[Hash]
-    D --> G[List]
+    A --> E[黑名单缓存]
+    A --> F[游戏偏好缓存]
+    A --> G[分布式锁]
+    
+    B --> B1[Sorted Set<br>按在线状态排序]
+    B --> B2[Hash<br>好友基本信息]
+    
+    C --> C1[Hash<br>用户状态详情]
+    C --> C2[Set<br>在线用户集合]
+    
+    D --> D1[List<br>待处理请求]
+    D --> D2[Hash<br>请求详情]
+    
+    E --> E1[Set<br>黑名单集合]
+    
+    F --> F1[Sorted Set<br>游戏时长排序]
+    F --> F2[Hash<br>游戏偏好详情]
+    
+    G --> G1[String<br>分布式锁]
 ```
+
+#### 2.3.1 缓存键设计
+```go
+const (
+    // 好友列表相关
+    CACHE_KEY_FRIEND_LIST     = "friend:list:%d"        // ZSET，好友列表，score为在线状态
+    CACHE_KEY_FRIEND_INFO     = "friend:info:%d"        // HASH，好友信息
+    CACHE_KEY_FRIEND_GROUPS   = "friend:groups:%d"      // SET，好友分组列表
+    
+    // 用户状态相关
+    CACHE_KEY_USER_STATUS     = "user:status:%d"        // HASH，用户状态详情
+    CACHE_KEY_ONLINE_USERS    = "user:online"           // SET，在线用户集合
+    
+    // 好友请求相关
+    CACHE_KEY_PENDING_REQUESTS = "friend:requests:%d"    // LIST，待处理的好友请求
+    CACHE_KEY_REQUEST_INFO    = "friend:request:%d"      // HASH，请求详情
+    
+    // 黑名单相关
+    CACHE_KEY_BLACKLIST       = "blacklist:%d"          // SET，用户的黑名单集合
+    
+    // 游戏偏好相关
+    CACHE_KEY_GAME_PREF      = "game:pref:%d"          // ZSET，用户游戏偏好，score为游戏时长
+    CACHE_KEY_GAME_INFO      = "game:info:%d"          // HASH，游戏详情
+    
+    // 分布式锁相关
+    CACHE_KEY_LOCK_FRIEND    = "lock:friend:%d:%d"     // STRING，好友操作锁
+    CACHE_KEY_LOCK_STATUS    = "lock:status:%d"        // STRING，状态更新锁
+    
+    // 缓存过期时间
+    CACHE_EXPIRE_FRIEND_LIST = time.Minute * 5
+    CACHE_EXPIRE_USER_STATUS = time.Minute * 1
+    CACHE_EXPIRE_LOCK        = time.Second * 30
+)
+```
+
+#### 2.3.2 缓存更新策略
+1. **好友列表缓存**
+   - 写入：好友关系变更时更新
+   - 过期：5分钟
+   - 更新机制：延迟双删
+
+2. **用户状态缓存**
+   - 写入：状态变更时实时更新
+   - 过期：1分钟
+   - 更新机制：先更新数据库，再删除缓存
+
+3. **好友请求缓存**
+   - 写入：发送请求时写入
+   - 过期：无过期时间
+   - 更新机制：请求状态变更时更新
+
+4. **黑名单缓存**
+   - 写入：添加黑名单时写入
+   - 过期：无过期时间
+   - 更新机制：增删改时同步更新
+
+5. **游戏偏好缓存**
+   - 写入：游戏结束时更新
+   - 过期：1天
+   - 更新机制：增量更新
+
+6. **分布式锁**
+   - 写入：操作开始时获取
+   - 过期：30秒
+   - 更新机制：操作完成后释放
 
 ## 3. 核心功能实现
 
