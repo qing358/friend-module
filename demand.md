@@ -10,11 +10,11 @@
   - [1.5 推荐系统模块](#15-推荐系统模块)
   - [1.6 消息ID定义](#16-消息id定义)
 - [2. 数据模型设计](#2-数据模型设计)
-  - [2.1 数据库表结构](#21-数据库表结构)
-  - [2.2 数据结构定义](#22-数据结构定义-golang)
+  - [2.1 Redis 数据结构设计](#21-redis-数据结构设计)
+  - [2.2 数据操作接口](#22-数据操作接口)
   - [2.3 缓存设计](#23-缓存设计)
-    - [2.3.1 缓存键设计](#231-缓存键设计)
-    - [2.3.2 缓存更新策略](#232-缓存更新策略)
+    - [2.3.1 数据一致性保证](#231-数据一致性保证)
+    - [2.3.2 高可用设计](#232-高可用设计)
 - [3. 功能实现](#3-功能实现)
   - [3.1 好友管理功能](#31-好友管理功能)
     - [3.1.1 消息ID定义](#311-消息id定义)
@@ -291,327 +291,463 @@ const (
 
 ## 2. 数据模型设计
 
-### 2.1 数据库表结构
-
-```sql
--- 用户基础信息表
-CREATE TABLE users (
-    user_id BIGINT PRIMARY KEY,
-    username VARCHAR(50) NOT NULL,
-    status_code TINYINT DEFAULT 1,  -- 1:在线 2:离开 3:繁忙 4:隐身
-    last_active TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_username (username),
-    INDEX idx_status (status_code)
-);
-
--- 好友关系表
-CREATE TABLE friendships (
-    id BIGINT PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    friend_id BIGINT NOT NULL,
-    group_id BIGINT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE KEY unique_friendship (user_id, friend_id),
-    INDEX idx_user_id (user_id),
-    INDEX idx_friend_id (friend_id)
-);
-
--- 好友分组表
-CREATE TABLE friend_groups (
-    group_id BIGINT PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    group_name VARCHAR(50) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_user_id (user_id)
-);
-
--- 好友请求表
-CREATE TABLE friend_requests (
-    request_id BIGINT PRIMARY KEY,
-    sender_id BIGINT NOT NULL,
-    receiver_id BIGINT NOT NULL,
-    status TINYINT DEFAULT 0,  -- 0:待处理 1:已接受 2:已拒绝
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_sender (sender_id),
-    INDEX idx_receiver (receiver_id),
-    INDEX idx_status (status)
-);
-
--- 用户状态表
-CREATE TABLE user_status (
-    user_id BIGINT PRIMARY KEY,
-    current_game VARCHAR(100),
-    custom_status VARCHAR(200),
-    last_updated TIMESTAMP,
-    INDEX idx_last_updated (last_updated)
-);
-
--- 游戏偏好表（用于好友推荐）
-CREATE TABLE user_game_preferences (
-    id BIGINT PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    game_id BIGINT NOT NULL,
-    play_time INT NOT NULL,  -- 游戏时长（分钟）
-    last_played TIMESTAMP,   -- 最后一次游戏时间
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_user_game (user_id, game_id),
-    INDEX idx_last_played (last_played)
-);
-
--- 用户互动记录表（用于好友推荐）
-CREATE TABLE user_interactions (
-    id BIGINT PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    target_id BIGINT NOT NULL,
-    interaction_type TINYINT NOT NULL, -- 1:聊天 2:组队 3:交易等
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_user_target (user_id, target_id),
-    INDEX idx_created_at (created_at)
-);
-
--- 黑名单表
-CREATE TABLE blacklist (
-    id BIGINT PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    target_id BIGINT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE KEY unique_blacklist (user_id, target_id),
-    INDEX idx_user_id (user_id),
-    INDEX idx_target_id (target_id)
-);
-```
-
-### 2.2 数据结构定义 (Golang)
+### 2.1 Redis 数据结构设计
 
 ```go
-// 状态码常量
 const (
-    STATUS_OFFLINE = iota
-    STATUS_ONLINE
-    STATUS_AWAY
-    STATUS_BUSY
-    STATUS_INVISIBLE
+    // User Center 公共区域 - 用户基础信息
+    KEY_USER_CENTER = "uc:user:{uid}"        // Hash - 用户基本信息(等级、头像、名称等)
+    KEY_USER_STATUS = "uc:status:{uid}"      // Hash - 用户状态信息
+    KEY_ONLINE_USERS = "uc:online"           // Set - 在线用户集合
+    KEY_USERNAME_TO_ID = "uc:name:{name}"    // String - 用户名到ID的映射
+    
+    // 好友系统
+    KEY_FRIEND_HASH = "friend:hash:{uid}"    // Hash - 好友关系(key:好友ID, value:json包含时间和好友度)
+    KEY_FRIEND_REQ = "friend:req:{uid}"      // Hash - 好友申请(key:申请者ID, value:json包含时间和消息)
+    KEY_BLACKLIST = "friend:black:{uid}"     // Hash - 黑名单(key:目标ID, value:json包含时间和原因)
+    
+    // 好友分组相关
+    KEY_GROUP_LIST = "friend:group:{uid}"    // Hash - 分组列表(key:分组ID, value:分组名称)
+    KEY_GROUP_MEMBERS = "friend:gm:{gid}"    // Set - 分组成员ID集合
+    
+    // 游戏偏好相关(推荐系统用)
+    KEY_GAME_PREF = "game:pref:{uid}"       // Sorted Set - 用户游戏偏好,score为游戏时长
+    KEY_ACTIVE_TIME = "game:active:{uid}"    // Hash - 用户活跃时间段统计
+    
+    // ID生成器
+    KEY_ID_GENERATOR = "id:gen:{type}"       // String - 各类ID生成器
 )
 
-// 互动类型常量
-const (
-    INTERACTION_CHAT = iota + 1
-    INTERACTION_TEAM
-    INTERACTION_TRADE
-    INTERACTION_GIFT
-    INTERACTION_PVP
-)
-
-// 好友请求状态常量
-const (
-    FRIEND_REQUEST_PENDING = iota
-    FRIEND_REQUEST_ACCEPTED
-    FRIEND_REQUEST_REJECTED
-)
-
-// 用户信息
-type User struct {
-    UserID    int64     `json:"user_id"`
-    Username  string    `json:"username"`
-    Status    int8      `json:"status"`
-    LastActive time.Time `json:"last_active"`
-    CreatedAt time.Time `json:"created_at"`
+// User Center 数据结构
+type UserCenterInfo struct {
+    UserID      string `json:"user_id"`
+    Username    string `json:"username"`
+    Level       int32  `json:"level"`
+    Avatar     string `json:"avatar"`
+    Title      string `json:"title"`
+    VipLevel   int32  `json:"vip_level"`
+    LastActive int64  `json:"last_active"`
+    CreatedAt  int64  `json:"created_at"`
 }
 
-// 好友关系
-type Friendship struct {
-    ID        int64     `json:"id"`
-    UserID    int64     `json:"user_id"`
-    FriendID  int64     `json:"friend_id"`
-    GroupID   int64     `json:"group_id"`
-    CreatedAt time.Time `json:"created_at"`
+// 好友关系数据
+type FriendInfo struct {
+    FriendID   string `json:"friend_id"`
+    Intimacy   int32  `json:"intimacy"`     // 好友度
+    CreateTime int64  `json:"create_time"`
+    GroupID    string `json:"group_id,omitempty"`
 }
 
-// 好友请求
+// 好友申请数据
 type FriendRequest struct {
-    RequestID  int64     `json:"request_id"`
-    SenderID   int64     `json:"sender_id"`
-    ReceiverID int64     `json:"receiver_id"`
-    Status     int8      `json:"status"`
-    CreatedAt  time.Time `json:"created_at"`
+    SenderID   string `json:"sender_id"`
+    Message    string `json:"message"`
+    CreateTime int64  `json:"create_time"`
 }
 
-// 游戏偏好信息
-type GamePreference struct {
-    ID         int64     `json:"id"`
-    UserID     int64     `json:"user_id"`
-    GameID     int64     `json:"game_id"`
-    PlayTime   int       `json:"play_time"`
-    LastPlayed time.Time `json:"last_played"`
-    CreatedAt  time.Time `json:"created_at"`
+// 黑名单数据
+type BlacklistInfo struct {
+    TargetID   string `json:"target_id"`
+    Reason     string `json:"reason"`
+    CreateTime int64  `json:"create_time"`
 }
 
-// 用户互动记录
-type UserInteraction struct {
-    ID             int64     `json:"id"`
-    UserID         int64     `json:"user_id"`
-    TargetID       int64     `json:"target_id"`
-    InteractionType int8      `json:"interaction_type"`
-    CreatedAt      time.Time `json:"created_at"`
+// 数据过期时间
+const (
+    EXPIRE_USER_INFO = time.Hour * 24 * 7    // 用户信息缓存7天
+    EXPIRE_USER_STATUS = time.Minute * 5     // 用户状态缓存5分钟
+    EXPIRE_FRIEND_REQ = time.Hour * 24 * 30  // 好友请求保存30天
+)
+
+// Redis DAO 接口
+type UserCenterDAO interface {
+    // 用户基本信息
+    GetUserInfo(ctx context.Context, userID string) (*UserCenterInfo, error)
+    SetUserInfo(ctx context.Context, info *UserCenterInfo) error
+    GetUsersByIDs(ctx context.Context, userIDs []string) ([]*UserCenterInfo, error)
+    UpdateUserStatus(ctx context.Context, userID string, status int32) error
 }
 
-// 黑名单记录
-type Blacklist struct {
-    ID        int64     `json:"id"`
-    UserID    int64     `json:"user_id"`
-    TargetID  int64     `json:"target_id"`
-    CreatedAt time.Time `json:"created_at"`
+type FriendDAO interface {
+    // 好友关系
+    AddFriend(ctx context.Context, userID, friendID string, info *FriendInfo) error
+    RemoveFriend(ctx context.Context, userID, friendID string) error
+    GetFriendList(ctx context.Context, userID string) (map[string]*FriendInfo, error)
+    
+    // 好友申请
+    CreateFriendRequest(ctx context.Context, userID string, req *FriendRequest) error
+    GetFriendRequests(ctx context.Context, userID string) (map[string]*FriendRequest, error)
+    
+    // 黑名单
+    AddToBlacklist(ctx context.Context, userID string, info *BlacklistInfo) error
+    RemoveFromBlacklist(ctx context.Context, userID, targetID string) error
+    GetBlacklist(ctx context.Context, userID string) (map[string]*BlacklistInfo, error)
 }
 
-// 用户状态
-type UserStatus struct {
-    UserID       int64     `json:"user_id"`
-    Status       int8      `json:"status"`
-    CurrentGame  string    `json:"current_game"`
-    CustomStatus string    `json:"custom_status"`
-    UpdatedAt    int64     `json:"updated_at"`
+// Redis Lua 脚本定义
+const (
+    // 添加好友关系的 Lua 脚本
+    ADD_FRIEND_SCRIPT = `
+        local userID = KEYS[1]
+        local friendID = KEYS[2]
+        local friendInfo = ARGV[1]
+        
+        -- 检查是否已经是好友
+        local existingFriend = redis.call('HGET', 'friend:hash:'..userID, friendID)
+        if existingFriend then
+            return {err = "already friends"}
+        end
+        
+        -- 检查是否在黑名单中
+        local isBlocked = redis.call('HGET', 'friend:black:'..userID, friendID)
+        if isBlocked then
+            return {err = "user is blocked"}
+        end
+        
+        -- 原子性地添加双向好友关系
+        redis.call('HSET', 'friend:hash:'..userID, friendID, friendInfo)
+        redis.call('HSET', 'friend:hash:'..friendID, userID, friendInfo)
+        
+        return {ok = 1}
+    `
+    
+    // 更新用户状态的 Lua 脚本
+    UPDATE_STATUS_SCRIPT = `
+        local userID = KEYS[1]
+        local status = ARGV[1]
+        local customStatus = ARGV[2]
+        local currentGame = ARGV[3]
+        
+        -- 更新状态
+        redis.call('HMSET', 'uc:status:'..userID, 
+            'status', status,
+            'custom_status', customStatus,
+            'current_game', currentGame,
+            'updated_at', redis.call('TIME')[1]
+        )
+        
+        -- 更新在线用户集合
+        if status == '1' then
+            redis.call('SADD', 'uc:online', userID)
+        else
+            redis.call('SREM', 'uc:online', userID)
+        end
+        
+        -- 获取好友列表用于通知
+        return redis.call('HKEYS', 'friend:hash:'..userID)
+    `
+    
+    // 添加到黑名单的 Lua 脚本
+    ADD_BLACKLIST_SCRIPT = `
+        local userID = KEYS[1]
+        local targetID = KEYS[2]
+        local reason = ARGV[1]
+        
+        -- 检查并删除好友关系
+        local isFriend = redis.call('HEXISTS', 'friend:hash:'..userID, targetID)
+        if isFriend == 1 then
+            -- 删除双向好友关系
+            redis.call('HDEL', 'friend:hash:'..userID, targetID)
+            redis.call('HDEL', 'friend:hash:'..targetID, userID)
+        end
+        
+        -- 添加到黑名单
+        local blacklistInfo = string.format('{"target_id":"%s","reason":"%s","create_time":%d}',
+            targetID, reason, redis.call('TIME')[1])
+        redis.call('HSET', 'friend:black:'..userID, targetID, blacklistInfo)
+        
+        return {ok = 1}
+    `
+    
+    // 处理好友申请的 Lua 脚本
+    HANDLE_FRIEND_REQUEST_SCRIPT = `
+        local targetID = KEYS[1]
+        local userID = KEYS[2]
+        local status = ARGV[1]
+        local friendInfo = ARGV[2]
+        
+        -- 检查请求是否存在
+        local req = redis.call('HGET', 'friend:req:'..targetID, userID)
+        if not req then
+            return {err = "request not found"}
+        end
+        
+        if status == '1' then
+            -- 创建好友关系
+            redis.call('HSET', 'friend:hash:'..targetID, userID, friendInfo)
+            redis.call('HSET', 'friend:hash:'..userID, targetID, friendInfo)
+        end
+        
+        -- 删除请求
+        redis.call('HDEL', 'friend:req:'..targetID, userID)
+        
+        return {ok = 1}
+    `
+)
+
+// FriendService 结构体增加 Lua 脚本字段
+type FriendService struct {
+    redis  *redis.Client
+    logger *zap.Logger
+    
+    // Lua 脚本
+    addFriendScript        *redis.Script
+    updateStatusScript     *redis.Script
+    addBlacklistScript    *redis.Script
+    handleRequestScript   *redis.Script
 }
 
-// 好友分组
-type FriendGroup struct {
-    GroupID    int64     `json:"group_id"`
-    UserID     int64     `json:"user_id"`
-    GroupName  string    `json:"group_name"`
-    CreatedAt  time.Time `json:"created_at"`
+// 初始化 FriendService
+func NewFriendService(redis *redis.Client, logger *zap.Logger) *FriendService {
+    return &FriendService{
+        redis:  redis,
+        logger: logger,
+        
+        // 初始化 Lua 脚本
+        addFriendScript:     redis.NewScript(ADD_FRIEND_SCRIPT),
+        updateStatusScript:  redis.NewScript(UPDATE_STATUS_SCRIPT),
+        addBlacklistScript: redis.NewScript(ADD_BLACKLIST_SCRIPT),
+        handleRequestScript: redis.NewScript(HANDLE_FRIEND_REQUEST_SCRIPT),
+    }
 }
 
-// 游戏信息
-type GameInfo struct {
-    GameID      int64     `json:"game_id"`
-    GameName    string    `json:"game_name"`
-    GameTags    []string  `json:"game_tags"`
-    CreatedAt   time.Time `json:"created_at"`
+// 使用 Lua 脚本实现添加好友
+func (s *FriendService) AddFriend(ctx context.Context, userID, friendID string, info *FriendInfo) error {
+    // 序列化好友信息
+    friendInfo, err := json.Marshal(info)
+    if err != nil {
+        return err
+    }
+    
+    // 执行 Lua 脚本
+    result, err := s.addFriendScript.Run(ctx, s.redis,
+        []string{userID, friendID},  // keys
+        string(friendInfo),          // args
+    ).Result()
+    
+    if err != nil {
+        return err
+    }
+    
+    // 处理结果
+    res, ok := result.(map[string]interface{})
+    if !ok {
+        return errors.New("invalid script result")
+    }
+    
+    if errMsg, exists := res["err"]; exists {
+        return errors.New(errMsg.(string))
+    }
+    
+    return nil
 }
 
-// 用户特征
-type UserFeatures struct {
-    UserID          int64             `json:"user_id"`
-    GamePreferences []*GamePreference `json:"game_preferences"`
-    ActiveTimeSlots []int32          `json:"active_time_slots"` // 24小时制的活跃时间段
-    InteractionStats map[string]int   `json:"interaction_stats"` // 各类互动的统计
+// 使用 Lua 脚本实现状态更新
+func (s *FriendService) UpdateStatus(ctx context.Context, userID string, status int32, customStatus, currentGame string) error {
+    // 执行 Lua 脚本
+    result, err := s.updateStatusScript.Run(ctx, s.redis,
+        []string{userID},                              // keys
+        strconv.Itoa(int(status)), customStatus, currentGame,  // args
+    ).Result()
+    
+    if err != nil {
+        return err
+    }
+    
+    // 获取需要通知的好友列表
+    friendIDs, ok := result.([]string)
+    if !ok {
+        return errors.New("invalid script result")
+    }
+    
+    // 异步发送状态更新通知
+    go func() {
+        for _, friendID := range friendIDs {
+            s.sendStatusNotification(ctx, friendID, &FriendStatusNotify{
+                UserID:       userID,
+                Status:       status,
+                CustomStatus: customStatus,
+                CurrentGame:  currentGame,
+                UpdatedAt:    time.Now().Unix(),
+            })
+        }
+    }()
+    
+    return nil
 }
 
-// 搜索选项
-type FriendSearchOptions struct {
-    Keyword    string    `json:"keyword"`     // 搜索关键词
-    GroupID    int64     `json:"group_id"`    // 分组ID
-    Status     int8      `json:"status"`      // 在线状态过滤
-    SortBy     string    `json:"sort_by"`     // 排序字段
-    SortOrder  string    `json:"sort_order"`  // 排序顺序
-    PageSize   int32     `json:"page_size"`   // 分页大小
-    PageNum    int32     `json:"page_num"`    // 页码
+// 使用 Lua 脚本实现添加黑名单
+func (s *FriendService) AddToBlacklist(ctx context.Context, userID, targetID string, reason string) error {
+    // 执行 Lua 脚本
+    result, err := s.addBlacklistScript.Run(ctx, s.redis,
+        []string{userID, targetID},  // keys
+        reason,                      // args
+    ).Result()
+    
+    if err != nil {
+        return err
+    }
+    
+    // 处理结果
+    res, ok := result.(map[string]interface{})
+    if !ok {
+        return errors.New("invalid script result")
+    }
+    
+    if errMsg, exists := res["err"]; exists {
+        return errors.New(errMsg.(string))
+    }
+    
+    return nil
 }
 
-// 用户基本信息
-type UserInfo struct {
-    UserID       int64     `json:"user_id"`
-    Username     string    `json:"username"`
-    Status       int8      `json:"status"`
-    CurrentGame  string    `json:"current_game"`
-    CustomStatus string    `json:"custom_status"`
-    LastActive   time.Time `json:"last_active"`
+// 使用 Lua 脚本实现处理好友请求
+func (s *FriendService) HandleFriendRequest(ctx context.Context, targetID, userID string, status int32) error {
+    // 创建好友信息
+    friendInfo := &FriendInfo{
+        FriendID:   userID,
+        CreateTime: time.Now().Unix(),
+    }
+    
+    // 序列化好友信息
+    info, err := json.Marshal(friendInfo)
+    if err != nil {
+        return err
+    }
+    
+    // 执行 Lua 脚本
+    result, err := s.handleRequestScript.Run(ctx, s.redis,
+        []string{targetID, userID},           // keys
+        strconv.Itoa(int(status)), string(info),  // args
+    ).Result()
+    
+    if err != nil {
+        return err
+    }
+    
+    // 处理结果
+    res, ok := result.(map[string]interface{})
+    if !ok {
+        return errors.New("invalid script result")
+    }
+    
+    if errMsg, exists := res["err"]; exists {
+        return errors.New(errMsg.(string))
+    }
+    
+    return nil
+}
+```
+
+### 2.2 数据操作接口
+
+```go
+// Redis 数据访问接口
+type RedisDAO interface {
+    // 用户相关
+    GetUserInfo(ctx context.Context, userID int64) (*UserInfo, error)
+    SetUserInfo(ctx context.Context, user *UserInfo) error
+    UpdateUserStatus(ctx context.Context, status *UserStatus) error
+    GetOnlineUsers(ctx context.Context) ([]int64, error)
+    
+    // 好友关系相关
+    AddFriend(ctx context.Context, userID, friendID int64) error
+    RemoveFriend(ctx context.Context, userID, friendID int64) error
+    GetFriendList(ctx context.Context, userID int64) ([]int64, error)
+    CreateFriendRequest(ctx context.Context, req *FriendRequest) error
+    GetFriendRequests(ctx context.Context, userID int64) ([]*FriendRequest, error)
+    
+    // 好友分组相关
+    CreateGroup(ctx context.Context, group *FriendGroup) error
+    AddToGroup(ctx context.Context, groupID int64, memberID int64) error
+    RemoveFromGroup(ctx context.Context, groupID int64, memberID int64) error
+    GetGroupMembers(ctx context.Context, groupID int64) ([]int64, error)
+    
+    // 黑名单相关
+    AddToBlacklist(ctx context.Context, userID, targetID int64) error
+    RemoveFromBlacklist(ctx context.Context, userID, targetID int64) error
+    IsInBlacklist(ctx context.Context, userID, targetID int64) (bool, error)
+    
+    // 游戏偏好相关
+    UpdateGamePreference(ctx context.Context, userID, gameID int64, playTime int) error
+    GetGamePreferences(ctx context.Context, userID int64) (map[int64]int, error)
+    
+    // ID生成
+    GenerateID(ctx context.Context, idType string) (int64, error)
+}
+
+// Redis DAO 实现
+type RedisDAOImpl struct {
+    redis  *redis.Client
+    logger *zap.Logger
+}
+
+// ID生成器实现
+func (d *RedisDAOImpl) GenerateID(ctx context.Context, idType string) (int64, error) {
+    key := fmt.Sprintf(KEY_ID_GENERATOR, idType)
+    return d.redis.Incr(ctx, key).Result()
+}
+
+// 好友关系实现示例
+func (d *RedisDAOImpl) AddFriend(ctx context.Context, userID, friendID int64) error {
+    pipe := d.redis.Pipeline()
+    
+    // 添加到双方的好友集合
+    key1 := fmt.Sprintf(KEY_FRIEND_SET, userID)
+    key2 := fmt.Sprintf(KEY_FRIEND_SET, friendID)
+    pipe.SAdd(ctx, key1, friendID)
+    pipe.SAdd(ctx, key2, userID)
+    
+    _, err := pipe.Exec(ctx)
+    return err
+}
+
+// 好友分组实现示例
+func (d *RedisDAOImpl) AddToGroup(ctx context.Context, groupID int64, memberID int64) error {
+    key := fmt.Sprintf(KEY_GROUP_MEMBERS, groupID)
+    return d.redis.SAdd(ctx, key, memberID).Err()
+}
+
+// 黑名单实现示例
+func (d *RedisDAOImpl) IsInBlacklist(ctx context.Context, userID, targetID int64) (bool, error) {
+    key := fmt.Sprintf(KEY_BLACKLIST, userID)
+    return d.redis.SIsMember(ctx, key, targetID).Result()
 }
 ```
 
 ### 2.3 缓存设计
-使用 Redis 作为缓存系统：
 
-```mermaid
-graph LR
-    A[Redis Cluster] --> B[好友列表缓存]
-    A --> C[用户状态缓存]
-    A --> D[好友请求缓存]
-    A --> E[黑名单缓存]
-    A --> F[游戏偏好缓存]
-    A --> G[分布式锁]
-    
-    B --> B1[Sorted Set<br>按在线状态排序]
-    B --> B2[Hash<br>好友基本信息]
-    
-    C --> C1[Hash<br>用户状态详情]
-    C --> C2[Set<br>在线用户集合]
-    
-    D --> D1[List<br>待处理请求]
-    D --> D2[Hash<br>请求详情]
-    
-    E --> E1[Set<br>黑名单集合]
-    
-    F --> F1[Sorted Set<br>游戏时长排序]
-    F --> F2[Hash<br>游戏偏好详情]
-    
-    G --> G1[String<br>分布式锁]
-```
+#### 2.3.1 数据一致性保证
+1. **分布式锁**
+   - 使用 Redis 的 SETNX 实现分布式锁
+   - 设置合理的锁超时时间
+   - 使用 Lua 脚本保证原子性
 
-#### 2.3.1 缓存键设计
-```go
-const (
-    // 好友列表相关
-    CACHE_KEY_FRIEND_LIST     = "friend:list:%d"        // ZSET，好友列表，score为在线状态
-    CACHE_KEY_FRIEND_INFO     = "friend:info:%d"        // HASH，好友信息
-    CACHE_KEY_FRIEND_GROUPS   = "friend:groups:%d"      // SET，好友分组列表
-    
-    // 用户状态相关
-    CACHE_KEY_USER_STATUS     = "user:status:%d"        // HASH，用户状态详情
-    CACHE_KEY_ONLINE_USERS    = "user:online"           // SET，在线用户集合
-    
-    // 好友请求相关
-    CACHE_KEY_PENDING_REQUESTS = "friend:requests:%d"    // LIST，待处理的好友请求
-    CACHE_KEY_REQUEST_INFO    = "friend:request:%d"      // HASH，请求详情
-    
-    // 黑名单相关
-    CACHE_KEY_BLACKLIST       = "blacklist:%d"          // SET，用户的黑名单集合
-    
-    // 游戏偏好相关
-    CACHE_KEY_GAME_PREF      = "game:pref:%d"          // ZSET，用户游戏偏好，score为游戏时长
-    CACHE_KEY_GAME_INFO      = "game:info:%d"          // HASH，游戏详情
-    
-    // 分布式锁相关
-    CACHE_KEY_LOCK_FRIEND    = "lock:friend:%d:%d"     // STRING，好友操作锁
-    CACHE_KEY_LOCK_STATUS    = "lock:status:%d"        // STRING，状态更新锁
-    
-    // 缓存过期时间
-    CACHE_EXPIRE_FRIEND_LIST = time.Minute * 5
-    CACHE_EXPIRE_USER_STATUS = time.Minute * 1
-    CACHE_EXPIRE_LOCK        = time.Second * 30
-)
-```
+2. **原子操作**
+   - 使用 Pipeline 批量执行命令
+   - 使用 Multi/Exec 事务
+   - 关键操作使用 Lua 脚本
 
-#### 2.3.2 缓存更新策略
-1. **好友列表缓存**
-   - 写入：好友关系变更时更新
-   - 过期：5分钟
-   - 更新机制：延迟双删
+3. **数据过期策略**
+   - 核心数据永久保存
+   - 状态类数据设置合理过期时间
+   - 使用定时任务清理过期数据
 
-2. **用户状态缓存**
-   - 写入：状态变更时实时更新
-   - 过期：1分钟
-   - 更新机制：先更新数据库，再删除缓存
+#### 2.3.2 高可用设计
+1. **Redis 集群**
+   - 主从复制
+   - 哨兵监控
+   - 集群分片
 
-3. **好友请求缓存**
-   - 写入：发送请求时写入
-   - 过期：无过期时间
-   - 更新机制：请求状态变更时更新
+2. **故障转移**
+   - 自动主从切换
+   - 数据自动同步
+   - 客户端重试机制
 
-4. **黑名单缓存**
-   - 写入：添加黑名单时写入
-   - 过期：无过期时间
-   - 更新机制：增删改时同步更新
-
-5. **游戏偏好缓存**
-   - 写入：游戏结束时更新
-   - 过期：1天
-   - 更新机制：增量更新
-
-6. **分布式锁**
-   - 写入：操作开始时获取
-   - 过期：30秒
-   - 更新机制：操作完成后释放
+3. **监控告警**
+   - 性能监控
+   - 容量监控
+   - 错误告警
 
 ## 3. 功能实现
 
@@ -683,169 +819,203 @@ sequenceDiagram
 ```
 
 ```go
-// AddFriend 通过用户名或ID添加好友
+// FriendService 好友管理服务
+type FriendService struct {
+    redis  *redis.Client
+    logger *zap.Logger
+    dao    RedisDAO
+}
+
+// AddFriend 添加好友
 func (s *FriendService) AddFriend(ctx context.Context, userID int64, target string) error {
-    // 1. 判断是通过用户名还是ID添加
-    var targetUser User
+    // 1. 获取目标用户信息
+    var targetID int64
     if id, err := strconv.ParseInt(target, 10, 64); err == nil {
-        // 通过ID添加
-        if err := s.db.First(&targetUser, id).Error; err != nil {
-            return err
-        }
+        targetID = id
     } else {
-        // 通过用户名添加
-        if err := s.db.Where("username = ?", target).First(&targetUser).Error; err != nil {
-            return err
+        // 通过用户名查找用户
+        key := fmt.Sprintf("user:name:%s", target)
+        var err error
+        targetID, err = s.redis.Get(ctx, key).Int64()
+        if err != nil {
+            return errors.New("user not found")
         }
     }
     
     // 2. 检查是否已经是好友
-    if s.IsFriend(ctx, userID, targetUser.UserID) {
+    isFriend, err := s.IsFriend(ctx, userID, targetID)
+    if err != nil {
+        return err
+    }
+    if isFriend {
         return errors.New("already friends")
     }
     
     // 3. 检查是否在黑名单中
-    if s.IsInBlacklist(ctx, targetUser.UserID, userID) {
+    isBlocked, err := s.dao.IsInBlacklist(ctx, targetID, userID)
+    if err != nil {
+        return err
+    }
+    if isBlocked {
         return errors.New("you are in target's blacklist")
     }
     
     // 4. 创建好友请求
-    return s.CreateFriendRequest(ctx, userID, targetUser.UserID)
+    return s.CreateFriendRequest(ctx, userID, targetID)
 }
 
-// DeleteFriend 删除好友关系
-func (s *FriendService) DeleteFriend(ctx context.Context, userID, friendID int64) error {
-    // 1. 获取分布式锁
-    lockKey := fmt.Sprintf(CACHE_KEY_LOCK_FRIEND, userID, friendID)
-    lock := s.redisLock.NewLock(lockKey, time.Second*30)
-    if err := lock.Lock(); err != nil {
-        return fmt.Errorf("failed to acquire lock: %w", err)
-    }
-    defer lock.Unlock()
-
-    // 2. 开启事务删除双向好友关系
-    tx := s.db.Begin()
-    if err := tx.Where("(user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)",
-        userID, friendID, friendID, userID).Delete(&Friendship{}).Error; err != nil {
-        tx.Rollback()
-        return fmt.Errorf("failed to delete friendship: %w", err)
-    }
-    if err := tx.Commit().Error; err != nil {
-        return fmt.Errorf("failed to commit transaction: %w", err)
-    }
-
-    // 3. 使用Pipeline批量更新缓存
-    pipe := s.redis.Pipeline()
-    
-    // 删除双方的好友缓存
-    pipe.Del(ctx, fmt.Sprintf(CACHE_KEY_FRIEND_LIST, userID))
-    pipe.Del(ctx, fmt.Sprintf(CACHE_KEY_FRIEND_LIST, friendID))
-    
-    // 从好友集合中移除
-    pipe.SRem(ctx, fmt.Sprintf("friend:set:%d", userID), friendID)
-    pipe.SRem(ctx, fmt.Sprintf("friend:set:%d", friendID), userID)
-    
-    // 执行Pipeline操作
-    if _, err := pipe.Exec(ctx); err != nil {
-        s.logger.Error("failed to update friend cache",
-            zap.Error(err),
-            zap.Int64("user_id", userID),
-            zap.Int64("friend_id", friendID))
-    }
-
-    // 4. 发送好友关系变更通知
-    go func() {
-        // 通知用户A
-        if session, ok := s.sessions.Load(userID); ok {
-            session.(*Session).Send(MSG_ID_DEL_FRIEND_RESP, &struct {
-                FriendID int64 `json:"friend_id"`
-            }{FriendID: friendID})
-        }
-        // 通知用户B
-        if session, ok := s.sessions.Load(friendID); ok {
-            session.(*Session).Send(MSG_ID_DEL_FRIEND_RESP, &struct {
-                FriendID int64 `json:"friend_id"`
-            }{FriendID: userID})
-        }
-    }()
-
-    return nil
-}
-
-// IsFriend 检查两个用户是否已经是好友
-func (s *FriendService) IsFriend(ctx context.Context, userID, friendID int64) bool {
-    // 1. 先查缓存
-    cacheKey := fmt.Sprintf(CACHE_KEY_FRIEND_LIST, userID)
-    if exists, err := s.redis.SIsMember(ctx, cacheKey, friendID).Result(); err == nil && exists {
-        return true
-    }
-    
-    // 2. 查数据库
-    var count int64
-    s.db.Model(&Friendship{}).
-        Where("(user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)",
-            user_id, friend_id, friend_id, user_id).
-        Count(&count)
-    
-    return count > 0
-}
-
-// IsInBlacklist 检查用户是否在黑名单中
-func (s *FriendService) IsInBlacklist(ctx context.Context, userID, targetID int64) bool {
-    // 1. 先查缓存
-    cacheKey := fmt.Sprintf(CACHE_KEY_BLACKLIST, userID)
-    if exists, err := s.redis.SIsMember(ctx, cacheKey, targetID).Result(); err == nil && exists {
-        return true
-    }
-    
-    // 2. 查数据库
-    var count int64
-    s.db.Model(&Blacklist{}).
-        Where("user_id = ? AND target_id = ?", user_id, target_id).
-        Count(&count)
-    
-    return count > 0
+// IsFriend 检查是否是好友
+func (s *FriendService) IsFriend(ctx context.Context, userID, friendID int64) (bool, error) {
+    key := fmt.Sprintf(KEY_FRIEND_SET, userID)
+    return s.redis.SIsMember(ctx, key, friendID).Result()
 }
 
 // CreateFriendRequest 创建好友请求
 func (s *FriendService) CreateFriendRequest(ctx context.Context, userID, targetID int64) error {
-    // 1. 获取分布式锁
-    lockKey := fmt.Sprintf(CACHE_KEY_LOCK_FRIEND, userID, targetID)
-    lock := s.redisLock.NewLock(lockKey, time.Second*30)
-    if err := lock.Lock(); err != nil {
-        return fmt.Errorf("failed to acquire lock: %w", err)
-    }
-    defer lock.Unlock()
-    
-    // 2. 创建好友请求
-    request := &FriendRequest{
-        RequestID:  generateID(),
-        SenderID:   userID,
-        ReceiverID: targetID,
-        Status:     FRIEND_REQUEST_PENDING,
-        CreatedAt:  time.Now(),
-    }
-    
-    if err := s.db.Create(request).Error; err != nil {
+    // 1. 生成请求ID
+    requestID, err := s.dao.GenerateID(ctx, "friend_req")
+    if err != nil {
         return err
     }
     
-    // 3. 更新缓存
-    cacheKey := fmt.Sprintf(CACHE_KEY_PENDING_REQUESTS, targetID)
-    s.redis.RPush(ctx, cacheKey, request.RequestID)
+    // 2. 创建请求记录
+    req := &FriendRequest{
+        RequestID:  requestID,
+        SenderID:   userID,
+        ReceiverID: targetID,
+        Status:     FRIEND_REQUEST_PENDING,
+        CreatedAt:  time.Now().Unix(),
+    }
+    
+    // 3. 使用Pipeline批量操作
+    pipe := s.redis.Pipeline()
+    
+    // 保存请求详情
+    reqKey := fmt.Sprintf(KEY_FRIEND_REQ, requestID)
+    pipe.HMSet(ctx, reqKey, map[string]interface{}{
+        "request_id":  requestID,
+        "sender_id":   userID,
+        "receiver_id": targetID,
+        "status":     FRIEND_REQUEST_PENDING,
+        "created_at": req.CreatedAt,
+    })
+    pipe.Expire(ctx, reqKey, EXPIRE_FRIEND_REQ)
+    
+    // 添加到接收者的请求列表
+    inKey := fmt.Sprintf(KEY_FRIEND_REQ_IN, targetID)
+    pipe.LPush(ctx, inKey, requestID)
+    
+    // 添加到发送者的请求列表
+    outKey := fmt.Sprintf(KEY_FRIEND_REQ_OUT, userID)
+    pipe.LPush(ctx, outKey, requestID)
+    
+    if _, err := pipe.Exec(ctx); err != nil {
+        return err
+    }
     
     // 4. 发送通知
-    if session, ok := s.sessions.Load(targetID); ok {
-        session.(*Session).Send(MSG_ID_FRIEND_REQUEST_NOTIFY, &FriendRequestProto{
-            RequestID:  request.RequestID,
-            SenderID:   request.SenderID,
-            ReceiverID: request.ReceiverID,
-            Status:     request.Status,
-            CreatedAt:  request.CreatedAt.Unix(),
-        })
+    if err := s.sendNotification(ctx, targetID, MSG_ID_FRIEND_REQUEST_NOTIFY, req); err != nil {
+        s.logger.Error("failed to send notification", zap.Error(err))
     }
     
     return nil
+}
+
+// GetFriendList 获取好友列表
+func (s *FriendService) GetFriendList(ctx context.Context, userID int64, opts *FriendSearchOptions) ([]*FriendInfo, error) {
+    // 1. 获取好友ID列表
+    key := fmt.Sprintf(KEY_FRIEND_SET, userID)
+    friendIDs, err := s.redis.SMembers(ctx, key).Result()
+    if err != nil {
+        return nil, err
+    }
+    
+    if len(friendIDs) == 0 {
+        return []*FriendInfo{}, nil
+    }
+    
+    // 2. 批量获取好友信息
+    pipe := s.redis.Pipeline()
+    infoKeys := make([]string, len(friendIDs))
+    statusKeys := make([]string, len(friendIDs))
+    
+    for i, fid := range friendIDs {
+        infoKeys[i] = fmt.Sprintf(KEY_USER_INFO, fid)
+        statusKeys[i] = fmt.Sprintf(KEY_USER_STATUS, fid)
+        pipe.HGetAll(ctx, infoKeys[i])
+        pipe.HGetAll(ctx, statusKeys[i])
+    }
+    
+    results, err := pipe.Exec(ctx)
+    if err != nil {
+        return nil, err
+    }
+    
+    // 3. 组装好友信息
+    friends := make([]*FriendInfo, 0)
+    for i := 0; i < len(results); i += 2 {
+        info := results[i].(*redis.StringStringMapCmd).Val()
+        status := results[i+1].(*redis.StringStringMapCmd).Val()
+        
+        friend := &FriendInfo{
+            UserID:       info["user_id"],
+            Username:     info["username"],
+            Status:       status["status"],
+            CurrentGame:  status["current_game"],
+            CustomStatus: status["custom_status"],
+        }
+        
+        // 应用过滤条件
+        if s.matchSearchOptions(friend, opts) {
+            friends = append(friends, friend)
+        }
+    }
+    
+    // 4. 排序
+    if opts != nil && opts.SortBy != "" {
+        s.sortFriends(friends, opts)
+    }
+    
+    return friends, nil
+}
+
+// matchSearchOptions 检查好友信息是否匹配搜索条件
+func (s *FriendService) matchSearchOptions(friend *FriendInfo, opts *FriendSearchOptions) bool {
+    if opts == nil {
+        return true
+    }
+    
+    // 关键词匹配
+    if opts.Keyword != "" && !strings.Contains(friend.Username, opts.Keyword) {
+        return false
+    }
+    
+    // 状态过滤
+    if opts.Status > 0 && friend.Status != opts.Status {
+        return false
+    }
+    
+    return true
+}
+
+// sortFriends 对好友列表排序
+func (s *FriendService) sortFriends(friends []*FriendInfo, opts *FriendSearchOptions) {
+    sort.Slice(friends, func(i, j int) bool {
+        switch opts.SortBy {
+        case "status":
+            if opts.SortOrder == "desc" {
+                return friends[i].Status > friends[j].Status
+            }
+            return friends[i].Status < friends[j].Status
+        case "username":
+            if opts.SortOrder == "desc" {
+                return friends[i].Username > friends[j].Username
+            }
+            return friends[i].Username < friends[j].Username
+        default:
+            return false
+        }
+    })
 }
 ```
 
@@ -1489,97 +1659,155 @@ graph TD
 ```go
 // RecommendationService 好友推荐服务
 type RecommendationService struct {
-    db     *gorm.DB
     redis  *redis.Client
     logger *zap.Logger
 }
 
-// RecommendationReason 推荐原因
-type RecommendationReason struct {
-    Type        string  // 推荐类型：common_friends, similar_games, active_time
-    Score       float64 // 相似度得分
-    Description string  // 推荐原因描述
-}
-
-// FriendRecommendation 好友推荐
-type FriendRecommendation struct {
-    User    *UserInfo
-    Reasons []*RecommendationReason
-    Score   float64
-}
-
 // GetRecommendations 获取好友推荐
 func (s *RecommendationService) GetRecommendations(ctx context.Context, userID int64) ([]*FriendRecommendation, error) {
-    // 1. 获取用户特征
-    userFeatures, err := s.getUserFeatures(ctx, userID)
+    // 1. 获取用户的游戏偏好
+    userPrefKey := fmt.Sprintf(KEY_GAME_PREF, userID)
+    userPrefs, err := s.redis.ZRangeWithScores(ctx, userPrefKey, 0, -1).Result()
     if err != nil {
         return nil, err
     }
     
-    // 2. 获取候选用户
-    candidates, err := s.getCandidateUsers(ctx, userID)
+    // 2. 获取用户的好友集合
+    friendKey := fmt.Sprintf(KEY_FRIEND_SET, userID)
+    friends, err := s.redis.SMembers(ctx, friendKey).Result()
     if err != nil {
         return nil, err
     }
     
-    // 3. 计算相似度和推荐原因
+    // 3. 获取用户的活跃时间
+    activeKey := fmt.Sprintf(KEY_ACTIVE_TIME, userID)
+    activeTime, err := s.redis.HGetAll(ctx, activeKey).Result()
+    if err != nil {
+        return nil, err
+    }
+    
+    // 4. 查找相似用户
     recommendations := make([]*FriendRecommendation, 0)
-    for _, candidate := range candidates {
-        // 计算共同好友
-        commonFriends, err := s.getCommonFriends(ctx, userID, candidate.UserID)
+    
+    // 4.1 基于游戏偏好查找
+    for _, pref := range userPrefs {
+        gameID := pref.Member.(string)
+        // 获取玩这个游戏的其他用户
+        gamePlayers := fmt.Sprintf("game:players:%s", gameID)
+        players, err := s.redis.ZRangeWithScores(ctx, gamePlayers, 0, 50).Result()
         if err != nil {
             continue
         }
         
-        // 计算游戏偏好相似度
-        gameSimilarity, err := s.calculateGameSimilarity(ctx, userID, candidate.UserID)
-        if err != nil {
-            continue
+        for _, player := range players {
+            targetID := player.Member.(string)
+            // 排除自己和已经是好友的用户
+            if targetID == strconv.FormatInt(userID, 10) || s.isInList(targetID, friends) {
+                continue
+            }
+            
+            score := s.calculateGameSimilarity(userPrefs, targetID)
+            if score > 0.5 { // 设置一个相似度阈值
+                rec := &FriendRecommendation{
+                    UserID: targetID,
+                    Score:  score,
+                    Reason: "你们玩相似的游戏",
+                }
+                recommendations = append(recommendations, rec)
+            }
         }
-        
-        // 计算活跃时间重叠度
-        activeTimeOverlap, err := s.calculateActiveTimeOverlap(ctx, userID, candidate.UserID)
-        if err != nil {
-            continue
-        }
-        
-        // 生成推荐原因
-        reasons := []*RecommendationReason{
-            {
-                Type:        "common_friends",
-                Score:       float64(len(commonFriends)) * 0.4,
-                Description: fmt.Sprintf("有%d个共同好友", len(commonFriends)),
-            },
-            {
-                Type:        "similar_games",
-                Score:       gameSimilarity * 0.4,
-                Description: "有相似的游戏兴趣",
-            },
-            {
-                Type:        "active_time",
-                Score:       activeTimeOverlap * 0.2,
-                Description: "经常在相同时间在线",
-            },
-        }
-        
-        // 计算总分
-        totalScore := 0.0
-        for _, reason := range reasons {
-            totalScore += reason.Score
-        }
-        
-        recommendations = append(recommendations, &FriendRecommendation{
-            User:    candidate,
-            Reasons: reasons,
-            Score:   totalScore,
-        })
     }
     
-    // 4. 排序
-    sort.Slice(recommendations, func(i, j int) bool {
-        return recommendations[i].Score > recommendations[j].Score
-    })
+    // 4.2 基于共同好友推荐
+    for _, friend := range friends {
+        friendsKey := fmt.Sprintf(KEY_FRIEND_SET, friend)
+        friendOfFriends, err := s.redis.SMembers(ctx, friendsKey).Result()
+        if err != nil {
+            continue
+        }
+        
+        for _, fof := range friendOfFriends {
+            if fof == strconv.FormatInt(userID, 10) || s.isInList(fof, friends) {
+                continue
+            }
+            
+            commonFriends := s.getCommonFriends(userID, fof)
+            if len(commonFriends) >= 2 { // 至少有2个共同好友
+                rec := &FriendRecommendation{
+                    UserID: fof,
+                    Score:  float64(len(commonFriends)) * 0.1,
+                    Reason: fmt.Sprintf("你们有%d个共同好友", len(commonFriends)),
+                }
+                recommendations = append(recommendations, rec)
+            }
+        }
+    }
     
-    return recommendations[:min(10, len(recommendations))], nil
+    // 4.3 基于活跃时间推荐
+    onlineUsers, err := s.redis.SMembers(ctx, KEY_ONLINE_USERS).Result()
+    if err == nil {
+        for _, online := range onlineUsers {
+            if online == strconv.FormatInt(userID, 10) || s.isInList(online, friends) {
+                continue
+            }
+            
+            targetActiveKey := fmt.Sprintf(KEY_ACTIVE_TIME, online)
+            targetActive, err := s.redis.HGetAll(ctx, targetActiveKey).Result()
+            if err != nil {
+                continue
+            }
+            
+            overlap := s.calculateTimeOverlap(activeTime, targetActive)
+            if overlap > 0.3 { // 设置时间重叠阈值
+                rec := &FriendRecommendation{
+                    UserID: online,
+                    Score:  overlap,
+                    Reason: "你们经常在相同时间在线",
+                }
+                recommendations = append(recommendations, rec)
+            }
+        }
+    }
+    
+    // 5. 排序和去重
+    recommendations = s.deduplicateAndSort(recommendations)
+    
+    // 6. 获取推荐用户的详细信息
+    return s.enrichRecommendations(ctx, recommendations[:min(10, len(recommendations))]), nil
+}
+
+// 辅助方法
+func (s *RecommendationService) isInList(target string, list []string) bool {
+    for _, item := range list {
+        if item == target {
+            return true
+        }
+    }
+    return false
+}
+
+func (s *RecommendationService) calculateGameSimilarity(userPrefs []redis.Z, targetID string) float64 {
+    // 实现游戏偏好相似度计算
+    return 0.0
+}
+
+func (s *RecommendationService) getCommonFriends(userID int64, targetID string) []string {
+    // 实现共同好友计算
+    return nil
+}
+
+func (s *RecommendationService) calculateTimeOverlap(time1, time2 map[string]string) float64 {
+    // 实现活跃时间重叠度计算
+    return 0.0
+}
+
+func (s *RecommendationService) deduplicateAndSort(recommendations []*FriendRecommendation) []*FriendRecommendation {
+    // 实现去重和排序
+    return recommendations
+}
+
+func (s *RecommendationService) enrichRecommendations(ctx context.Context, recommendations []*FriendRecommendation) []*FriendRecommendation {
+    // 补充用户详细信息
+    return recommendations
 }
 ```
