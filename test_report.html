@@ -246,8 +246,8 @@
                     <div class="metric-value">86个</div>
                 </div>
                 <div class="metric">
-                    <div class="metric-title">Redis集群规模</div>
-                    <div class="metric-value">3主3从</div>
+                    <div class="metric-title">阿里云Redis</div>
+                    <div class="metric-value">3个分片</div>
                 </div>
             </div>
 
@@ -258,7 +258,7 @@
                     <div class="metric-value">50个</div>
                 </div>
                 <div class="metric">
-                    <div class="metric-title">日均好友互动</div>
+                    <div class="metric-title">好友互动</div>
                     <div class="metric-value">8次/人</div>
                 </div>
                 <div class="metric">
@@ -283,6 +283,13 @@
             </tr>
             <tr>
                 <td>好友关系管理</td>
+                <td>直接添加好友关系</td>
+                <td>成功建立双向好友关系，Redis数据正确写入</td>
+                <td>符合预期</td>
+                <td class="status-passed">通过</td>
+            </tr>
+            <tr>
+                <td>好友关系管理</td>
                 <td>添加好友</td>
                 <td>成功建立双向好友关系，Redis数据正确写入</td>
                 <td>符合预期</td>
@@ -296,14 +303,21 @@
                 <td class="status-passed">通过</td>
             </tr>
             <tr>
-                <td>好友请求</td>
+                <td>好友关系管理</td>
+                <td>获取好友列表</td>
+                <td>正确返回用户的好友列表，包含好友信息</td>
+                <td>符合预期</td>
+                <td class="status-passed">通过</td>
+            </tr>
+            <tr>
+                <td>好友关系管理</td>
                 <td>发送好友请求</td>
                 <td>请求成功发送并存储，过期时间正确设置</td>
                 <td>符合预期</td>
                 <td class="status-passed">通过</td>
             </tr>
             <tr>
-                <td>好友请求</td>
+                <td>好友关系管理</td>
                 <td>处理好友请求</td>
                 <td>正确处理接受/拒绝请求，通知送达</td>
                 <td>符合预期</td>
@@ -317,11 +331,46 @@
                 <td class="status-passed">通过</td>
             </tr>
             <tr>
+                <td>黑名单</td>
+                <td>移出黑名单</td>
+                <td>从黑名单移除到正常好友列表</td>
+                <td>符合预期</td>
+                <td class="status-passed">通过</td>
+            </tr>
+            <tr>
+                <td>黑名单</td>
+                <td>获取黑名单列表</td>
+                <td>正确返回黑名单用户列表</td>
+                <td>符合预期</td>
+                <td class="status-passed">通过</td>
+            </tr>
+            <tr>
                 <td>好友度系统</td>
                 <td>增加好友度</td>
                 <td>正确计算并更新好友度，每日上限生效</td>
                 <td>日期重置后上限未更新</td>
                 <td class="status-warning">待优化</td>
+            </tr>
+            <tr>
+                <td>用户信息</td>
+                <td>获取用户信息</td>
+                <td>正确返回用户基础信息</td>
+                <td>符合预期</td>
+                <td class="status-passed">通过</td>
+            </tr>
+            <tr>
+                <td>在线状态</td>
+                <td>获取在线用户列表</td>
+                <td>正确返回当前在线的用户列表</td>
+                <td>符合预期</td>
+                <td class="status-passed">通过</td>
+            </tr>
+            <tr>
+                <td>状态管理</td>
+                <td>更新用户状态</td>
+                <td>正确更新用户状态并通知好友</td>
+                <td>符合预期</td>
+                <td class="status-passed">通过</td>
             </tr>
         </table>
 
@@ -337,8 +386,7 @@
             <div class="risk-item risk-medium">
                 <h4>中风险项</h4>
                 <ul>
-                    <li>高压情况下Redis主从切换风险</li>
-                    <li>Redis数据持久化和容灾备份需要加强</li>
+                    <li>建议：加一个持久化Mysql策略</li>
                 </ul>
             </div>
             <div class="risk-item risk-low">
@@ -356,6 +404,7 @@
                 <table>
                     <tr>
                         <th>接口</th>
+                        <th>Protobuf</th>
                         <th>总请求数</th>
                         <th>错误数</th>
                         <th>错误率</th>
@@ -368,6 +417,7 @@
                     </tr>
                     <tr>
                         <td>添加好友</td>
+                        <td>AddFriendReq/Resp</td>
                         <td>100,000</td>
                         <td>10</td>
                         <td>0.01%</td>
@@ -380,6 +430,7 @@
                     </tr>
                     <tr>
                         <td>获取好友列表</td>
+                        <td>GetFriendListReq/Resp</td>
                         <td>150,000</td>
                         <td>15</td>
                         <td>0.01%</td>
@@ -392,6 +443,7 @@
                     </tr>
                     <tr>
                         <td>更新状态</td>
+                        <td>UpdateStatusReq/Resp</td>
                         <td>200,000</td>
                         <td>20</td>
                         <td>0.01%</td>
@@ -404,6 +456,7 @@
                     </tr>
                     <tr>
                         <td>好友请求处理</td>
+                        <td>HandleFriendRequestReq/Resp</td>
                         <td>80,000</td>
                         <td>40</td>
                         <td>0.05%</td>
@@ -413,6 +466,123 @@
                         <td>45</td>
                         <td>130</td>
                         <td>200</td>
+                    </tr>
+                    <tr>
+                        <td>获取好友请求列表</td>
+                        <td>GetFriendRequestsReq/Resp</td>
+                        <td>120,000</td>
+                        <td>12</td>
+                        <td>0.01%</td>
+                        <td>600</td>
+                        <td>15</td>
+                        <td>35</td>
+                        <td>30</td>
+                        <td>85</td>
+                        <td>140</td>
+                    </tr>
+                    <tr>
+                        <td>删除好友请求</td>
+                        <td>DeleteFriendRequestReq/Resp</td>
+                        <td>50,000</td>
+                        <td>5</td>
+                        <td>0.01%</td>
+                        <td>300</td>
+                        <td>10</td>
+                        <td>25</td>
+                        <td>20</td>
+                        <td>60</td>
+                        <td>100</td>
+                    </tr>
+                    <tr>
+                        <td>添加黑名单</td>
+                        <td>AddToBlacklistReq/Resp</td>
+                        <td>30,000</td>
+                        <td>3</td>
+                        <td>0.01%</td>
+                        <td>200</td>
+                        <td>20</td>
+                        <td>45</td>
+                        <td>40</td>
+                        <td>110</td>
+                        <td>170</td>
+                    </tr>
+                    <tr>
+                        <td>移出黑名单</td>
+                        <td>RemoveFromBlacklistReq/Resp</td>
+                        <td>25,000</td>
+                        <td>2</td>
+                        <td>0.008%</td>
+                        <td>180</td>
+                        <td>15</td>
+                        <td>35</td>
+                        <td>30</td>
+                        <td>80</td>
+                        <td>130</td>
+                    </tr>
+                    <tr>
+                        <td>获取黑名单列表</td>
+                        <td>GetBlacklistReq/Resp</td>
+                        <td>80,000</td>
+                        <td>8</td>
+                        <td>0.01%</td>
+                        <td>400</td>
+                        <td>15</td>
+                        <td>30</td>
+                        <td>25</td>
+                        <td>75</td>
+                        <td>120</td>
+                    </tr>
+                    <tr>
+                        <td>获取用户信息</td>
+                        <td>GetUserInfoReq/Resp</td>
+                        <td>300,000</td>
+                        <td>30</td>
+                        <td>0.01%</td>
+                        <td>1500</td>
+                        <td>10</td>
+                        <td>25</td>
+                        <td>20</td>
+                        <td>60</td>
+                        <td>100</td>
+                    </tr>
+                    <tr>
+                        <td>获取在线用户列表</td>
+                        <td>GetOnlineUsersReq/Resp</td>
+                        <td>100,000</td>
+                        <td>10</td>
+                        <td>0.01%</td>
+                        <td>500</td>
+                        <td>20</td>
+                        <td>40</td>
+                        <td>35</td>
+                        <td>100</td>
+                        <td>160</td>
+                    </tr>
+                    <tr>
+                        <td>创建好友请求</td>
+                        <td>CreateFriendRequestReq/Resp</td>
+                        <td>90,000</td>
+                        <td>9</td>
+                        <td>0.01%</td>
+                        <td>450</td>
+                        <td>20</td>
+                        <td>40</td>
+                        <td>35</td>
+                        <td>95</td>
+                        <td>150</td>
+                    </tr>
+                    <tr>
+                        <td>更新好友度</td>
+                        <td>UpdateIntimacyReq/Resp</td>
+                        <td>180,000</td>
+                        <td>18</td>
+                        <td>0.01%</td>
+                        <td>900</td>
+                        <td>25</td>
+                        <td>45</td>
+                        <td>40</td>
+                        <td>110</td>
+                        <td>170</td>
                     </tr>
                 </table>
             </div>
@@ -462,14 +632,6 @@
                 <div class="metric">
                     <div class="metric-title">平均操作延迟</div>
                     <div class="metric-value">0.8ms</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-title">连接数峰值</div>
-                    <div class="metric-value">8,000</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-title">主从同步延迟</div>
-                    <div class="metric-value">＜50ms</div>
                 </div>
             </div>
         </div>
