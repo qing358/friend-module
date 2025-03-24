@@ -182,11 +182,6 @@
 	// 状态更新通知的 Redis Stream key
 	KEY_STATUS_NOTIFY = "notify:status"    // Stream - 状态更新通知队列
 	KEY_INTIMACY_DAILY = "friend:intimacy:daily:{uid}:{fid}"  // String - 每日好友度计数
-
-	// 分组相关常量
-	DEFAULT_GROUP_ID = "0"              // 默认分组ID
-	DEFAULT_GROUP_NAME = "我的好友"      // 默认分组名称
-	MAX_GROUP_COUNT = 10                // 最大分组数量
 )
 
 const (
@@ -263,22 +258,6 @@ const (
         return {ok = 1}
     `
 
-	// 分组管理的 Lua 脚本
-	CREATE_GROUP_SCRIPT = `
-        local userID = KEYS[1]
-        local groupInfo = ARGV[1]
-
-        -- 检查分组数量是否超限
-        local groupCount = redis.call('HLEN', 'friend:group:'..userID)
-        if groupCount &gt;= tonumber(ARGV[2]) then
-            return {err = "max group count reached"}
-        end
-
-        -- 创建分组
-        redis.call('HSET', 'friend:group:'..userID, ARGV[3], groupInfo)
-        return {ok = 1}
-    `
-
 	// 处理好友请求的 Lua 脚本
 	HANDLE_REQUEST_SCRIPT = `
         local receiverID = KEYS[1]
@@ -334,7 +313,6 @@ type FriendInfo struct {
 	FriendID   string `json:"friend_id"`
 	Intimacy   int32  `json:"intimacy"` // 好友度
 	CreateTime int64  `json:"create_time"`
-	GroupID    string `json:"group_id,omitempty"`
 }
 
 // 好友申请数据
@@ -348,14 +326,6 @@ type FriendRequest struct {
 type BlacklistInfo struct {
 	TargetID   string `json:"target_id"`
 	Reason     string `json:"reason"`
-	CreateTime int64  `json:"create_time"`
-}
-
-// FriendGroup 好友分组
-type FriendGroup struct {
-	GroupID    string `json:"group_id"`
-	GroupName  string `json:"group_name"`
-	UserID     string `json:"user_id"`
 	CreateTime int64  `json:"create_time"`
 }
 
@@ -393,7 +363,6 @@ type FriendService struct {
 	updateStatusScript     *redis.Script
 	addBlacklistScript    *redis.Script
 	handleRequestScript   *redis.Script
-	createGroupScript     *redis.Script
 }
 
 const (
@@ -417,7 +386,6 @@ func NewFriendService(redis *redis.Client, logger *zap.Logger) *FriendService {
 		updateStatusScript:  redis.NewScript(UPDATE_STATUS_SCRIPT),
 		addBlacklistScript:  redis.NewScript(ADD_BLACKLIST_SCRIPT),
 		handleRequestScript: redis.NewScript(HANDLE_REQUEST_SCRIPT),
-		createGroupScript:   redis.NewScript(CREATE_GROUP_SCRIPT),
 	}
 }
 
@@ -866,200 +834,7 @@ func (s *FriendService) notifyFriendAdded(ctx context.Context, userID, friendID 
 			zap.Int64("friend_id", friendID))
 	}
 }
-
-// CreateGroup 创建好友分组
-func (s *FriendService) CreateGroup(ctx context.Context, userID int64, groupName string) (*FriendGroup, error) {
-	// 生成分组ID
-	groupID := strconv.FormatInt(time.Now().UnixNano(), 10)
-
-	// 创建分组信息
-	group := &amp;FriendGroup{
-		GroupID:    groupID,
-		GroupName:  groupName,
-		UserID:     strconv.FormatInt(userID, 10),
-		CreateTime: time.Now().Unix(),
-	}
-
-	// 序列化分组信息
-	groupInfo, err := json.Marshal(group)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal group info: %w", err)
-	}
-
-	// 执行 Lua 脚本
-	result, err := s.createGroupScript.Run(ctx, s.redis,
-		[]string{strconv.FormatInt(userID, 10)},
-		string(groupInfo),
-		MAX_GROUP_COUNT,
-		groupID,
-	).Result()
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to create group: %w", err)
-	}
-
-	// 处理结果
-	res, ok := result.(map[string]interface{})
-	if !ok {
-		return nil, errors.New("invalid script result")
-	}
-
-	if errMsg, exists := res["err"]; exists {
-		return nil, errors.New(errMsg.(string))
-	}
-
-	return group, nil
-}
-
-// DeleteGroup 删除好友分组
-func (s *FriendService) DeleteGroup(ctx context.Context, userID int64, groupID string) error {
-	if groupID == DEFAULT_GROUP_ID {
-		return errors.New("cannot delete default group")
-	}
-
-	// 使用 Pipeline 执行操作
-	pipe := s.redis.Pipeline()
-
-	// 获取分组中的好友
-	key := fmt.Sprintf(KEY_FRIEND_HASH, userID)
-	members, err := s.redis.HGetAll(ctx, key).Result()
-	if err != nil {
-		return fmt.Errorf("failed to get group members: %w", err)
-	}
-
-	// 将好友移动到默认分组
-	for friendID, info := range members {
-		var friendInfo FriendInfo
-		if err := json.Unmarshal([]byte(info), &amp;friendInfo); err != nil {
-			continue
-		}
-
-		if friendInfo.GroupID == groupID {
-			friendInfo.GroupID = DEFAULT_GROUP_ID
-			if newInfo, err := json.Marshal(friendInfo); err == nil {
-				pipe.HSet(ctx, key, friendID, string(newInfo))
-			}
-		}
-	}
-
-	// 删除分组
-	groupKey := fmt.Sprintf("friend:group:%d", userID)
-	pipe.HDel(ctx, groupKey, groupID)
-
-	// 执行 Pipeline
-	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("failed to delete group: %w", err)
-	}
-
-	return nil
-}
-
-// MoveFriendToGroup 移动好友到指定分组
-func (s *FriendService) MoveFriendToGroup(ctx context.Context, userID int64, friendID int64, groupID string) error {
-	// 检查分组是否存在
-	groupKey := fmt.Sprintf("friend:group:%d", userID)
-	exists, err := s.redis.HExists(ctx, groupKey, groupID).Result()
-	if err != nil {
-		return fmt.Errorf("failed to check group: %w", err)
-	}
-
-	if !exists &amp;&amp; groupID != DEFAULT_GROUP_ID {
-		return errors.New("group not found")
-	}
-
-	// 获取好友信息
-	key := fmt.Sprintf(KEY_FRIEND_HASH, userID)
-	info, err := s.redis.HGet(ctx, key, strconv.FormatInt(friendID, 10)).Result()
-	if err != nil {
-		return fmt.Errorf("failed to get friend info: %w", err)
-	}
-
-	var friendInfo FriendInfo
-	if err := json.Unmarshal([]byte(info), &amp;friendInfo); err != nil {
-		return fmt.Errorf("failed to unmarshal friend info: %w", err)
-	}
-
-	// 更新分组
-	friendInfo.GroupID = groupID
-
-	// 序列化并保存
-	newInfo, err := json.Marshal(friendInfo)
-	if err != nil {
-		return fmt.Errorf("failed to marshal updated friend info: %w", err)
-	}
-
-	if err := s.redis.HSet(ctx, key, strconv.FormatInt(friendID, 10), string(newInfo)).Err(); err != nil {
-		return fmt.Errorf("failed to update friend info: %w", err)
-	}
-
-	return nil
-}
-
-// GetGroups 获取用户的好友分组列表
-func (s *FriendService) GetGroups(ctx context.Context, userID int64) ([]*FriendGroup, error) {
-	key := fmt.Sprintf("friend:group:%d", userID)
-	result, err := s.redis.HGetAll(ctx, key).Result()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get groups: %w", err)
-	}
-
-	groups := make([]*FriendGroup, 0, len(result)+1)
-
-	// 添加默认分组
-	groups = append(groups, &amp;FriendGroup{
-		GroupID:    DEFAULT_GROUP_ID,
-		GroupName:  DEFAULT_GROUP_NAME,
-		UserID:     strconv.FormatInt(userID, 10),
-		CreateTime: 0,
-	})
-
-	// 解析其他分组
-	for _, v := range result {
-		var group FriendGroup
-		if err := json.Unmarshal([]byte(v), &amp;group); err != nil {
-			s.logger.Error("failed to unmarshal group info",
-				zap.Error(err),
-				zap.String("data", v))
-			continue
-		}
-		groups = append(groups, &amp;group)
-	}
-
-	// 按创建时间排序
-	sort.Slice(groups, func(i, j int) bool {
-		return groups[i].CreateTime &lt; groups[j].CreateTime
-	})
-
-	return groups, nil
-}
-
-// GetFriendsByGroup 获取分组中的好友列表
-func (s *FriendService) GetFriendsByGroup(ctx context.Context, userID int64, groupID string) ([]*FriendInfo, error) {
-	// 获取所有好友
-	key := fmt.Sprintf(KEY_FRIEND_HASH, userID)
-	result, err := s.redis.HGetAll(ctx, key).Result()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get friends: %w", err)
-	}
-
-	// 过滤指定分组的好友
-	friends := make([]*FriendInfo, 0)
-	for _, v := range result {
-		var info FriendInfo
-		if err := json.Unmarshal([]byte(v), &amp;info); err != nil {
-			s.logger.Error("failed to unmarshal friend info",
-				zap.Error(err),
-				zap.String("data", v))
-			continue
-		}
-
-		if info.GroupID == groupID {
-			friends = append(friends, &amp;info)
-		}
-	}
-
-	return friends, nil
-}</code></pre>
+</code></pre>
 
 	<!--beforeend--></div><!--afterend--></div>
 </body>
